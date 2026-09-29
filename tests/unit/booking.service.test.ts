@@ -175,7 +175,17 @@ describe("BookingService", () => {
           check_in: new Date("2026-10-01"),
           check_out: new Date("2026-10-05"),
         })
-        .mockResolvedValueOnce({ booking_id: VALID_UUID, status: "confirmed", version: 1 });
+        .mockResolvedValueOnce({
+          booking_id: VALID_UUID,
+          guest_id: GUEST_ID,
+          hotel_id: HOTEL_ID,
+          room_type_id: ROOM_TYPE_ID,
+          check_in: new Date("2026-10-01"),
+          check_out: new Date("2026-10-05"),
+          channel: "direct",
+          status: "confirmed",
+          version: 1,
+        });
       mockPrisma.booking.updateMany.mockResolvedValue({ count: 1 });
 
       const result = await bookingService.confirm(VALID_UUID);
@@ -184,6 +194,12 @@ describe("BookingService", () => {
       expect(mockPrisma.booking.updateMany).toHaveBeenCalledWith({
         where: { booking_id: VALID_UUID, status: "pending", version: 0 },
         data: { status: "confirmed", version: { increment: 1 } },
+      });
+      expect(mockPrisma.eventOutbox.create).toHaveBeenCalledWith({
+        data: {
+          event_type: "booking.confirmed",
+          payload: expect.objectContaining({ booking_id: VALID_UUID }),
+        },
       });
       expect(result.status).toBe("confirmed");
     });

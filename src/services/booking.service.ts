@@ -89,6 +89,10 @@ export class BookingService {
    * (REST síncrono, lock optimista con CAS sobre `inventory`); solo si el stock
    * se asegura, transiciona a `confirmed`. Si la confirmación local falla por
    * concurrencia, compensa liberando el inventario reservado.
+   *
+   * La transición y el evento `booking.confirmed` van en la misma transacción
+   * (outbox): Front Desk proyecta la llegada como `confirmed` solo al recibir
+   * este evento, nunca con `booking.created` (que nace `pending`).
    */
   async confirm(id: string) {
     const existing = await prisma.booking.findUnique({
@@ -115,28 +119,59 @@ export class BookingService {
 
     await reserveInventory(range);
 
-    const updated = await prisma.booking.updateMany({
-      where: {
-        booking_id: id,
-        status: "pending",
-        version: existing.version,
-      },
-      data: {
-        status: "confirmed",
-        version: { increment: 1 },
-      },
-    });
+    const confirmed = await prisma
+      .$transaction(async (tx) => {
+        const updated = await tx.booking.updateMany({
+          where: {
+            booking_id: id,
+            status: "pending",
+            version: existing.version,
+          },
+          data: {
+            status: "confirmed",
+            version: { increment: 1 },
+          },
+        });
 
-    if (updated.count === 0) {
-      await releaseInventory(range).catch(() => undefined);
-      throw new AppError(
-        409,
-        "Booking was modified concurrently, please retry",
-        "Conflict"
-      );
-    }
+        if (updated.count === 0) {
+          throw new AppError(
+            409,
+            "Booking was modified concurrently, please retry",
+            "Conflict"
+          );
+        }
 
-    return this.findById(id);
+        const row = await tx.booking.findUnique({
+          where: { booking_id: id },
+        });
+
+        if (!row) {
+          throw new AppError(
+            404,
+            `Booking with id ${id} not found`,
+            "Not Found"
+          );
+        }
+
+        await enqueueOutboxEvent(tx, "booking.confirmed", {
+          booking_id: row.booking_id,
+          guest_id: row.guest_id,
+          hotel_id: row.hotel_id,
+          room_type_id: row.room_type_id,
+          check_in: toIsoDate(row.check_in),
+          check_out: toIsoDate(row.check_out),
+          channel: row.channel,
+        });
+
+        return row;
+      })
+      .catch(async (err) => {
+        // La transacción hizo rollback: el inventario reservado se libera.
+        await releaseInventory(range).catch(() => undefined);
+        throw err;
+      });
+
+    return confirmed;
   }
 
   async cancel(id: string) {
