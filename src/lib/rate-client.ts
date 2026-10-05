@@ -3,11 +3,14 @@ import { AppError } from "../middleware/error-handler.js";
 const RATE_SERVICE_URL =
   process.env.RATE_SERVICE_URL || "http://localhost:3002/v1";
 
+const SERVICE_API_KEY = process.env.SERVICE_API_KEY || "";
+
 export interface RateRangeInput {
   room_type_id: string;
   check_in: string;
   check_out: string;
   count?: number;
+  idempotency_key?: string;
 }
 
 /**
@@ -20,7 +23,10 @@ async function ratePost<T>(path: string, body: unknown): Promise<T> {
   try {
     res = await fetch(`${RATE_SERVICE_URL}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(SERVICE_API_KEY ? { "x-service-key": SERVICE_API_KEY } : {}),
+      },
       body: JSON.stringify(body),
     });
   } catch {

@@ -12,15 +12,26 @@ export const bookingStatusSchema = z.enum([
 
 export const bookingChannelSchema = z.enum(["direct", "ota", "phone"]);
 
+const guestSchema = z.object({
+  name: z.string().trim().min(1).max(255),
+  email: z.string().trim().toLowerCase().email().max(255),
+  phone: z.string().trim().min(1).max(50),
+});
+
+/**
+ * Reserva anonima: el navegador envia los datos de contacto del huesped y
+ * el backend genera `guest_id` + `manage_token` del lado servidor. Nunca se
+ * acepta un `guest_id` elegido por el cliente.
+ */
 export const createBookingSchema = z
   .object({
-    guest_id: z.string().uuid(),
     hotel_id: z.string().uuid(),
     room_type_id: z.string().uuid(),
     check_in: dateSchema,
     check_out: dateSchema,
     channel: bookingChannelSchema.default("direct"),
     total_amount: z.number().nonnegative(),
+    guest: guestSchema,
   })
   .refine((data) => data.check_out > data.check_in, {
     message: "check_out must be after check_in",
@@ -37,5 +48,15 @@ export const listBookingsQuerySchema = z.object({
   date: dateSchema.optional(),
 });
 
+/**
+ * Token de gestion anonima. Viaja preferentemente en el header
+ * `x-manage-token` (en query queda en logs e historial); se acepta
+ * `GET /:id?token=` y `POST /:id/cancel?token=` por compatibilidad.
+ */
+export const manageTokenQuerySchema = z.object({
+  token: z.string().min(1).max(256).optional(),
+});
+
 export type CreateBookingInput = z.infer<typeof createBookingSchema>;
 export type ListBookingsQuery = z.infer<typeof listBookingsQuerySchema>;
+export type ManageTokenQuery = z.infer<typeof manageTokenQuerySchema>;
