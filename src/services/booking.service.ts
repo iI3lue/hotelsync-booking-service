@@ -1,4 +1,5 @@
 import {
+  createHmac,
   createHash,
   randomBytes,
   randomUUID,
@@ -30,9 +31,66 @@ const STAFF_ROLES = ["SUPER_ADMIN", "MANAGER", "RECEPTIONIST"];
 /** Vigencia del codigo de gestion anonima (reutilizable dentro del plazo). */
 export const MANAGE_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
+const CONFIRMATION_RECONCILE_BATCH = 50;
+const RETRY_BASE_MS = 30_000;
+const RETRY_MAX_MS = 15 * 60_000;
+
 function hashManageToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
 }
+
+function newManageToken(data: CreateBookingInput): string {
+  if (data.channel.startsWith("ota:") && data.channel_external_id) {
+    const secret = process.env.CHANNEL_MANAGER_MANAGE_TOKEN_SECRET;
+    if (secret && secret.length >= 32) {
+      // El mismo request OTA siempre obtiene el mismo token, incluso si el
+      // CM reintenta tras perder la respuesta. La key es dedicada y estable;
+      // no reutilizar la service key que puede rotarse independientemente.
+      return createHmac("sha256", secret)
+        .update(`${data.channel}\0${data.channel_external_id}`)
+        .digest("hex");
+    }
+    if (process.env.NODE_ENV === "test") {
+      return createHmac("sha256", "test-channel-manage-token-secret-32b!")
+        .update(`${data.channel}\0${data.channel_external_id}`)
+        .digest("hex");
+    }
+    throw new Error(
+      "CHANNEL_MANAGER_MANAGE_TOKEN_SECRET must be set (min 32 chars)"
+    );
+  }
+  return randomBytes(32).toString("hex");
+}
+
+function isUniqueConstraintError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: unknown }).code === "P2002"
+  );
+}
+
+function errorMessage(error: unknown): string {
+  return (error instanceof Error ? error.message : String(error)).slice(0, 1000);
+}
+
+function retryDelay(attempts: number): number {
+  return Math.min(RETRY_BASE_MS * 2 ** Math.min(Math.max(attempts - 1, 0), 5), RETRY_MAX_MS);
+}
+
+type ConfirmationBooking = {
+  booking_id: string;
+  version: number;
+  guest_id: string;
+  guest_name: string | null;
+  hotel_id: string;
+  room_type_id: string;
+  check_in: Date;
+  check_out: Date;
+  channel: string;
+  channel_external_id: string | null;
+};
 
 type ManagedBooking = {
   manage_token_hash: string | null;
@@ -77,46 +135,92 @@ export class BookingService {
       );
     }
 
-    const manageToken = randomBytes(32).toString("hex");
+    const findChannelReplay = async () => {
+      if (data.channel_external_id === undefined) return null;
+      return prisma.booking.findUnique({
+        where: {
+          channel_channel_external_id: {
+            channel: data.channel,
+            channel_external_id: data.channel_external_id,
+          },
+        },
+      });
+    };
+
+    // El token OTA es determinista (HMAC dedicado) para poder repetir la
+    // respuesta si el CM perdió el primer response tras un commit exitoso.
+    // En web directa se mantiene aleatorio como hasta ahora.
+    const manageToken = newManageToken(data);
+    const replay = await findChannelReplay();
+    if (replay) {
+      return {
+        ...stripManageHash(replay),
+        manage_token: manageToken,
+        created: false as const,
+      };
+    }
 
     // Outbox transaccional: reserva + evento se confirman juntos.
     // Si el proceso muere aquí, no hay fila en outbox (rollback) y el
     // dispatcher nunca publica un evento huérfano. El dispatcher publica
     // a RabbitMQ con confirm y marca `sent` solo tras el confirm.
-    const booking = await prisma.$transaction(async (tx) => {
-      const created = await tx.booking.create({
-        data: {
-          guest_id: randomUUID(),
-          guest_name: data.guest.name,
-          guest_email: data.guest.email,
-          guest_phone: data.guest.phone,
-          booked_by_user_id: actor?.sub ?? null,
-          manage_token_hash: hashManageToken(manageToken),
-          manage_token_expires_at: new Date(Date.now() + MANAGE_TOKEN_TTL_MS),
-          hotel_id: data.hotel_id,
-          room_type_id: data.room_type_id,
-          check_in: new Date(data.check_in),
-          check_out: new Date(data.check_out),
-          channel: data.channel,
-          total_amount: data.total_amount,
-        },
+    try {
+      const booking = await prisma.$transaction(async (tx) => {
+        const created = await tx.booking.create({
+          data: {
+            guest_id: randomUUID(),
+            guest_name: data.guest.name,
+            guest_email: data.guest.email,
+            guest_phone: data.guest.phone,
+            booked_by_user_id: actor?.sub ?? null,
+            manage_token_hash: hashManageToken(manageToken),
+            manage_token_expires_at: new Date(Date.now() + MANAGE_TOKEN_TTL_MS),
+            hotel_id: data.hotel_id,
+            room_type_id: data.room_type_id,
+            check_in: new Date(data.check_in),
+            check_out: new Date(data.check_out),
+            channel: data.channel,
+            channel_external_id: data.channel_external_id ?? null,
+            total_amount: data.total_amount,
+          },
+        });
+
+        await enqueueOutboxEvent(tx, "booking.created", {
+          booking_id: created.booking_id,
+          guest_id: created.guest_id,
+          guest_name: created.guest_name,
+          hotel_id: created.hotel_id,
+          room_type_id: created.room_type_id,
+          check_in: created.check_in.toISOString().slice(0, 10),
+          check_out: created.check_out.toISOString().slice(0, 10),
+          channel: created.channel,
+          channel_external_id: created.channel_external_id ?? null,
+          occurred_at: new Date().toISOString(),
+        });
+
+        return created;
       });
 
-      await enqueueOutboxEvent(tx, "booking.created", {
-        booking_id: created.booking_id,
-        guest_id: created.guest_id,
-        guest_name: created.guest_name,
-        hotel_id: created.hotel_id,
-        room_type_id: created.room_type_id,
-        check_in: created.check_in.toISOString().slice(0, 10),
-        check_out: created.check_out.toISOString().slice(0, 10),
-        channel: created.channel,
-      });
-
-      return created;
-    });
-
-    return { ...stripManageHash(booking), manage_token: manageToken };
+      return {
+        ...stripManageHash(booking),
+        manage_token: manageToken,
+        created: true as const,
+      };
+    } catch (error) {
+      // Dos entregas concurrentes pueden pasar el pre-check a la vez. La
+      // UNIQUE de DB elige un ganador; el otro lee y devuelve el mismo recurso.
+      if (data.channel_external_id !== undefined && isUniqueConstraintError(error)) {
+        const winner = await findChannelReplay();
+        if (winner) {
+          return {
+            ...stripManageHash(winner),
+            manage_token: manageToken,
+            created: false as const,
+          };
+        }
+      }
+      throw error;
+    }
   }
 
   async findById(id: string) {
@@ -143,6 +247,105 @@ export class BookingService {
     if (actor.role === "SUPER_ADMIN") return;
     if (!STAFF_ROLES.includes(actor.role) || actor.hotel_id !== booking.hotel_id) {
       throw new AppError(403, "Not allowed to access this booking", "Forbidden");
+    }
+  }
+
+  private async ensureReservationAttempt(bookingId: string) {
+    const now = new Date();
+    return prisma.inventoryReservationAttempt.upsert({
+      where: { booking_id: bookingId },
+      create: {
+        booking_id: bookingId,
+        idempotency_key: `booking:${bookingId}:confirm`,
+        status: "pending",
+        attempts: 1,
+        next_attempt_at: now,
+      },
+      update: {
+        status: "pending",
+        attempts: { increment: 1 },
+        next_attempt_at: now,
+        last_error: null,
+      },
+    });
+  }
+
+  private async scheduleReservationRetry(
+    bookingId: string,
+    attempts: number,
+    error: unknown,
+    status: "pending" | "compensating" = "pending"
+  ): Promise<void> {
+    await prisma.inventoryReservationAttempt.update({
+      where: { booking_id: bookingId },
+      data: {
+        status,
+        attempts: { increment: 1 },
+        next_attempt_at: new Date(Date.now() + retryDelay(attempts)),
+        last_error: errorMessage(error),
+      },
+    });
+  }
+
+  /** Local confirmation, outbox event and saga completion commit atomically. */
+  private async finalizeConfirmation(booking: ConfirmationBooking): Promise<boolean> {
+    return prisma.$transaction(async (tx) => {
+      const updated = await tx.booking.updateMany({
+        where: {
+          booking_id: booking.booking_id,
+          status: "pending",
+          version: booking.version,
+        },
+        data: {
+          status: "confirmed",
+          version: { increment: 1 },
+        },
+      });
+      if (updated.count === 0) return false;
+
+      await enqueueOutboxEvent(tx, "booking.confirmed", {
+        booking_id: booking.booking_id,
+        guest_id: booking.guest_id,
+        guest_name: booking.guest_name,
+        hotel_id: booking.hotel_id,
+        room_type_id: booking.room_type_id,
+        check_in: toIsoDate(booking.check_in),
+        check_out: toIsoDate(booking.check_out),
+        channel: booking.channel,
+        channel_external_id: booking.channel_external_id,
+        occurred_at: new Date().toISOString(),
+      });
+      await tx.inventoryReservationAttempt.update({
+        where: { booking_id: booking.booking_id },
+        data: { status: "completed", last_error: null },
+      });
+      return true;
+    });
+  }
+
+  private async compensateReservation(
+    booking: Pick<ConfirmationBooking, "booking_id" | "room_type_id" | "check_in" | "check_out">,
+    attemptCount: number
+  ): Promise<void> {
+    try {
+      await releaseInventory({
+        room_type_id: booking.room_type_id,
+        check_in: toIsoDate(booking.check_in),
+        check_out: toIsoDate(booking.check_out),
+        idempotency_key: `booking:${booking.booking_id}:confirm-compensate`,
+      });
+      await prisma.inventoryReservationAttempt.update({
+        where: { booking_id: booking.booking_id },
+        data: { status: "failed", last_error: null },
+      });
+    } catch (error) {
+      await this.scheduleReservationRetry(
+        booking.booking_id,
+        attemptCount,
+        error,
+        "compensating"
+      );
+      throw error;
     }
   }
 
@@ -223,28 +426,48 @@ export class BookingService {
       check_in: toIsoDate(existing.check_in),
       check_out: toIsoDate(existing.check_out),
     };
+    const attempt = await this.ensureReservationAttempt(id);
 
-    // Claves distintas para reservar y para compensar: si la reserva
-    // aplicó y la compensación usa otra clave, no se deduplica entre sí.
-    await reserveInventory({ ...range, idempotency_key: `booking:${id}:confirm` });
-
-    const updated = await prisma.booking.updateMany({
-      where: {
-        booking_id: id,
-        status: "pending",
-        version: existing.version,
-      },
-      data: {
-        status: "confirmed",
-        version: { increment: 1 },
-      },
-    });
-
-    if (updated.count === 0) {
-      await releaseInventory({
+    // R&A is remote, so this is a saga, not a cross-database transaction.
+    // The durable attempt is written first; retries always use the same key.
+    try {
+      await reserveInventory({
         ...range,
-        idempotency_key: `booking:${id}:confirm-compensate`,
-      }).catch(() => undefined);
+        idempotency_key: attempt.idempotency_key,
+      });
+    } catch (error) {
+      if (error instanceof AppError && error.statusCode === 409) {
+        await prisma.inventoryReservationAttempt.update({
+          where: { booking_id: id },
+          data: { status: "failed", last_error: errorMessage(error) },
+        });
+      } else {
+        await this.scheduleReservationRetry(id, attempt.attempts, error);
+      }
+      throw error;
+    }
+
+    let finalized: boolean;
+    try {
+      finalized = await this.finalizeConfirmation(existing as ConfirmationBooking);
+    } catch (error) {
+      // Resultado local incierto: no liberar inmediatamente. El intento
+      // durable re-ejecutará la reserva idempotente y completará el commit.
+      await this.scheduleReservationRetry(id, attempt.attempts, error);
+      throw error;
+    }
+
+    if (!finalized) {
+      const latest = await this.findById(id);
+      if (latest.status === "confirmed") {
+        // Otra petición ya confirmó y publicó el outbox en su transacción.
+        await prisma.inventoryReservationAttempt.update({
+          where: { booking_id: id },
+          data: { status: "completed", last_error: null },
+        });
+        return stripManageHash(latest);
+      }
+      await this.compensateReservation(existing as ConfirmationBooking, attempt.attempts);
       throw new AppError(
         409,
         "Booking was modified concurrently, please retry",
@@ -253,6 +476,131 @@ export class BookingService {
     }
 
     return stripManageHash(await this.findById(id));
+  }
+
+  /**
+   * Recupera reservas cuyo inventario pudo reservarse antes de que el
+   * proceso cayera. Repetir reserve con la misma idempotency_key no descuenta
+   * stock dos veces en R&A.
+   */
+  async reconcilePendingConfirmations(limit = CONFIRMATION_RECONCILE_BATCH) {
+    const due = await prisma.inventoryReservationAttempt.findMany({
+      where: {
+        status: { in: ["pending", "compensating"] },
+        next_attempt_at: { lte: new Date() },
+      },
+      orderBy: { next_attempt_at: "asc" },
+      take: limit,
+      include: { booking: true },
+    });
+
+    for (const attempt of due) {
+      const booking = attempt.booking;
+      if (attempt.status === "compensating") {
+        try {
+          await releaseInventory({
+            room_type_id: booking.room_type_id,
+            check_in: toIsoDate(booking.check_in),
+            check_out: toIsoDate(booking.check_out),
+            idempotency_key: `booking:${booking.booking_id}:confirm-compensate`,
+          });
+          await prisma.inventoryReservationAttempt.update({
+            where: { booking_id: booking.booking_id },
+            data: { status: "failed", last_error: null },
+          });
+        } catch (error) {
+          await this.scheduleReservationRetry(
+            booking.booking_id,
+            attempt.attempts,
+            error,
+            "compensating"
+          );
+        }
+        continue;
+      }
+
+      if (booking.status === "confirmed") {
+        await prisma.inventoryReservationAttempt.update({
+          where: { booking_id: booking.booking_id },
+          data: { status: "completed", last_error: null },
+        });
+        continue;
+      }
+      if (booking.status !== "pending") {
+        if (booking.status !== "cancelled") {
+          await prisma.inventoryReservationAttempt.update({
+            where: { booking_id: booking.booking_id },
+            data: { status: "failed", last_error: `Booking is ${booking.status}` },
+          });
+          continue;
+        }
+        // A pending attempt is ambiguous after a crash: R&A may or may not
+        // have committed the reserve. Reissue the same idempotent reserve
+        // first, then release it; releasing directly could inflate stock if
+        // the original request never reached R&A.
+        try {
+          await reserveInventory({
+            room_type_id: booking.room_type_id,
+            check_in: toIsoDate(booking.check_in),
+            check_out: toIsoDate(booking.check_out),
+            idempotency_key: attempt.idempotency_key,
+          });
+        } catch (error) {
+          if (error instanceof AppError && error.statusCode === 409) {
+            await prisma.inventoryReservationAttempt.update({
+              where: { booking_id: booking.booking_id },
+              data: { status: "failed", last_error: errorMessage(error) },
+            });
+          } else {
+            await this.scheduleReservationRetry(
+              booking.booking_id,
+              attempt.attempts,
+              error
+            );
+          }
+          continue;
+        }
+        await this.compensateReservation(booking, attempt.attempts).catch(
+          () => undefined
+        );
+        continue;
+      }
+
+      try {
+        await reserveInventory({
+          room_type_id: booking.room_type_id,
+          check_in: toIsoDate(booking.check_in),
+          check_out: toIsoDate(booking.check_out),
+          idempotency_key: attempt.idempotency_key,
+        });
+        const finalized = await this.finalizeConfirmation(booking);
+        if (!finalized) {
+          const latest = await this.findById(booking.booking_id);
+          if (latest.status === "confirmed") {
+            await prisma.inventoryReservationAttempt.update({
+              where: { booking_id: booking.booking_id },
+              data: { status: "completed", last_error: null },
+            });
+          } else {
+            await this.compensateReservation(booking, attempt.attempts);
+          }
+        }
+      } catch (error) {
+        if (error instanceof AppError && error.statusCode === 409) {
+          await prisma.inventoryReservationAttempt.update({
+            where: { booking_id: booking.booking_id },
+            data: { status: "failed", last_error: errorMessage(error) },
+          });
+        } else {
+          await this.scheduleReservationRetry(
+            booking.booking_id,
+            attempt.attempts,
+            error
+          );
+        }
+      }
+    }
+    return due.length;
   }
 
   /**
@@ -300,6 +648,11 @@ export class BookingService {
         booking_id: updated.booking_id,
         hotel_id: updated.hotel_id,
         room_type_id: updated.room_type_id,
+        check_in: toIsoDate(updated.check_in),
+        check_out: toIsoDate(updated.check_out),
+        channel: updated.channel,
+        channel_external_id: updated.channel_external_id,
+        occurred_at: new Date().toISOString(),
       });
 
       return updated;

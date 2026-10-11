@@ -10,7 +10,17 @@ export const bookingStatusSchema = z.enum([
   "cancelled",
 ]);
 
-export const bookingChannelSchema = z.enum(["direct", "ota", "phone"]);
+/**
+ * Canal validado contra catálogo: directos de la casa más canales
+ * registrados (`ota:<nombre>` en minúsculas). El nombre lo valida
+ * Channel Manager contra `ota_channels`; Booking solo exige el formato.
+ */
+export const bookingChannelSchema = z
+  .string()
+  .regex(
+    /^(direct|phone|ota:[a-z0-9][a-z0-9-]{0,31})$/,
+    "Channel must be direct, phone or ota:<name>"
+  );
 
 const guestSchema = z.object({
   name: z.string().trim().min(1).max(255),
@@ -30,13 +40,28 @@ export const createBookingSchema = z
     check_in: dateSchema,
     check_out: dateSchema,
     channel: bookingChannelSchema.default("direct"),
+    // Id de la reserva en el sistema externo. Obligatorio para canales OTA:
+    // junto al UNIQUE(channel, channel_external_id) hace la ingesta
+    // idempotente dentro de la misma transacción de creación.
+    channel_external_id: z.string().trim().min(1).max(100).optional(),
     total_amount: z.number().nonnegative(),
     guest: guestSchema,
   })
   .refine((data) => data.check_out > data.check_in, {
     message: "check_out must be after check_in",
     path: ["check_out"],
-  });
+  })
+  .refine(
+    (data) =>
+      data.channel.startsWith("ota:")
+        ? data.channel_external_id !== undefined
+        : data.channel_external_id === undefined,
+    {
+      message:
+        "channel_external_id is required for ota channels and forbidden for direct/phone",
+      path: ["channel_external_id"],
+    }
+  );
 
 export const bookingIdParamSchema = z.object({
   id: z.string().uuid(),

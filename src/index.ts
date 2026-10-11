@@ -2,6 +2,7 @@ import express from "express";
 import { errorHandler } from "./middleware/error-handler.js";
 import bookingsRouter from "./routes/bookings.js";
 import { startOutboxDispatcher } from "./lib/outbox.js";
+import { startConfirmationReconciler } from "./lib/confirmation-reconciler.js";
 
 const app = express();
 const PORT = process.env.PORT || 3004;
@@ -34,6 +35,9 @@ if (process.env.NODE_ENV !== "test") {
     startOutboxDispatcher();
     console.log("Outbox dispatcher started (hotelsync.events)");
   }
+
+  startConfirmationReconciler();
+  console.log("Inventory confirmation reconciler started");
 }
 
 export default app;

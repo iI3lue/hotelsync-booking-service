@@ -21,6 +21,11 @@ jest.mock("../../src/lib/prisma.js", () => ({
       findMany: jest.fn(),
       update: jest.fn(),
     },
+    inventoryReservationAttempt: {
+      upsert: jest.fn(),
+      update: jest.fn(),
+      findMany: jest.fn(),
+    },
     $transaction: jest.fn(),
   },
 }));
@@ -44,9 +49,15 @@ const mockRelease = releaseInventory as jest.Mock;
 process.env.FRONT_DESK_SERVICE_KEY = "test-front-desk-key";
 process.env.HOUSEKEEPING_SERVICE_KEY = "test-housekeeping-key";
 process.env.BILLING_SERVICE_KEY = "test-billing-key";
+process.env.CHANNEL_MANAGER_SERVICE_KEY = "test-channel-manager-key";
+process.env.CHANNEL_MANAGER_MANAGE_TOKEN_SECRET =
+  "test-channel-manage-token-secret-32b!";
 
 // $transaction interactiva: passthrough al mismo mock (tx === prisma mockeado)
 mockPrisma.$transaction.mockImplementation(async (fn: any) => fn(mockPrisma));
+mockPrisma.inventoryReservationAttempt.upsert.mockImplementation(
+  async ({ create }: any) => create
+);
 
 const app = express();
 app.use(express.json());
@@ -126,6 +137,66 @@ describe("Booking Service API", () => {
         .send({ hotel_id: HOTEL_ID });
 
       expect(res.status).toBe(400);
+    });
+
+    it("should require Channel Manager credentials for OTA intake", async () => {
+      const res = await request(app)
+        .post("/v1/bookings")
+        .send({
+          ...validPayload,
+          channel: "ota:simulado",
+          channel_external_id: "external-1",
+        });
+
+      expect(res.status).toBe(401);
+    });
+
+    it("should require an external id for OTA bookings", async () => {
+      const res = await request(app)
+        .post("/v1/bookings")
+        .set("x-channel-manager-key", process.env.CHANNEL_MANAGER_SERVICE_KEY!)
+        .send({ ...validPayload, channel: "ota:simulado" });
+
+      expect(res.status).toBe(400);
+    });
+
+    it("should replay an OTA booking idempotently and return the same manage token", async () => {
+      const otaPayload = {
+        ...validPayload,
+        channel: "ota:simulado",
+        channel_external_id: "external-1",
+      };
+      const created = {
+        booking_id: VALID_UUID,
+        status: "pending",
+        guest_id: "generated-guest-id",
+        guest_name: "Ana",
+        ...otaPayload,
+        check_in: new Date("2026-10-01"),
+        check_out: new Date("2026-10-05"),
+      };
+      mockPrisma.booking.findUnique
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(created);
+      mockPrisma.booking.create.mockResolvedValue(created);
+
+      const first = await request(app)
+        .post("/v1/bookings")
+        .set("x-channel-manager-key", process.env.CHANNEL_MANAGER_SERVICE_KEY!)
+        .send(otaPayload);
+      const replay = await request(app)
+        .post("/v1/bookings")
+        .set("x-channel-manager-key", process.env.CHANNEL_MANAGER_SERVICE_KEY!)
+        .send(otaPayload);
+
+      expect(first.status).toBe(201);
+      expect(first.body.created).toBe(true);
+      expect(replay.status).toBe(200);
+      expect(replay.body.created).toBe(false);
+      expect(replay.body.booking_id).toBe(first.body.booking_id);
+      expect(replay.body.manage_token).toBe(first.body.manage_token);
+      expect(mockPrisma.booking.create).toHaveBeenCalledTimes(1);
+      expect(mockPrisma.eventOutbox.create).toHaveBeenCalledTimes(1);
     });
   });
 

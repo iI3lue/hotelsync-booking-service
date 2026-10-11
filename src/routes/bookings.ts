@@ -1,6 +1,11 @@
 import { Router } from "express";
 import { bookingController } from "../controllers/booking.controller.js";
-import { attachAuth, requireAuth, requireRole } from "../lib/auth.js";
+import {
+  attachAuth,
+  requireAuth,
+  requireRole,
+  requireChannelManagerForOta,
+} from "../lib/auth.js";
 import { validate } from "../middleware/validate.js";
 import {
   bookingIdParamSchema,
@@ -23,6 +28,7 @@ router.get(
 router.post(
   "/",
   attachAuth,
+  requireChannelManagerForOta,
   validate(createBookingSchema),
   bookingController.create.bind(bookingController)
 );

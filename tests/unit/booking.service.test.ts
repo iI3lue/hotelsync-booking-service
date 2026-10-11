@@ -6,10 +6,10 @@ import { AppError } from "../../src/middleware/error-handler.js";
 jest.mock("../../src/lib/prisma.js", () => ({
   __esModule: true,
   default: {
-    booking: {
-      findMany: jest.fn(),
-      findUnique: jest.fn(),
-      create: jest.fn(),
+      booking: {
+        findMany: jest.fn(),
+        findUnique: jest.fn(),
+        create: jest.fn(),
       update: jest.fn(),
       updateMany: jest.fn(),
     },
@@ -17,6 +17,11 @@ jest.mock("../../src/lib/prisma.js", () => ({
       create: jest.fn(),
       findMany: jest.fn(),
       update: jest.fn(),
+    },
+    inventoryReservationAttempt: {
+      upsert: jest.fn(),
+      update: jest.fn(),
+      findMany: jest.fn(),
     },
     $transaction: jest.fn(),
   },
@@ -42,6 +47,9 @@ const mockRelease = releaseInventory as jest.Mock;
 
 // $transaction interactiva: passthrough al mismo mock (tx === prisma mockeado)
 mockPrisma.$transaction.mockImplementation(async (fn: any) => fn(mockPrisma));
+mockPrisma.inventoryReservationAttempt.upsert.mockImplementation(
+  async ({ create }: any) => create
+);
 
 const VALID_UUID = "a1b2c3d4-e5f6-4890-abcd-ef1234567890";
 const GENERATED_GUEST_ID = "b1b2c3d4-e5f6-4890-abcd-ef1234567890";
@@ -108,7 +116,10 @@ describe("BookingService", () => {
 
       const result = await bookingService.create(baseInput);
 
-      expect(result.manage_token).toHaveLength(64);
+      expect(result.created).toBe(true);
+      if (result.created) {
+        expect(result.manage_token).toHaveLength(64);
+      }
       expect(result).not.toHaveProperty("manage_token_hash");
       expect(mockPrisma.$transaction).toHaveBeenCalled();
       expect(mockPrisma.booking.create).toHaveBeenCalledWith({
@@ -125,6 +136,7 @@ describe("BookingService", () => {
           check_in: new Date("2026-10-01"),
           check_out: new Date("2026-10-05"),
           channel: "direct",
+          channel_external_id: null,
           total_amount: 25500,
         },
       });
@@ -140,6 +152,8 @@ describe("BookingService", () => {
             check_in: "2026-10-01",
             check_out: "2026-10-05",
             channel: "direct",
+            channel_external_id: null,
+            occurred_at: expect.any(String),
           },
         },
       });
@@ -174,6 +188,96 @@ describe("BookingService", () => {
         })
       ).rejects.toThrow(AppError);
       expect(mockPrisma.booking.create).not.toHaveBeenCalled();
+    });
+
+    it("should store channel_external_id for ota channels", async () => {
+      mockPrisma.booking.findUnique.mockResolvedValue(null);
+      mockPrisma.booking.create.mockResolvedValue({
+        booking_id: VALID_UUID,
+        status: "pending",
+        guest_id: GENERATED_GUEST_ID,
+        guest_name: "Ana",
+        hotel_id: HOTEL_ID,
+        room_type_id: ROOM_TYPE_ID,
+        check_in: new Date("2026-10-01"),
+        check_out: new Date("2026-10-05"),
+        channel: "ota:simulado",
+        channel_external_id: "EXT-123",
+      });
+
+      const result = await bookingService.create({
+        ...baseInput,
+        channel: "ota:simulado",
+        channel_external_id: "EXT-123",
+      });
+
+      expect(result.created).toBe(true);
+      expect(mockPrisma.booking.findUnique).toHaveBeenCalledWith({
+        where: {
+          channel_channel_external_id: {
+            channel: "ota:simulado",
+            channel_external_id: "EXT-123",
+          },
+        },
+      });
+      expect(mockPrisma.booking.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          channel: "ota:simulado",
+          channel_external_id: "EXT-123",
+        }),
+      });
+    });
+
+    it("should replay without creating nor emitting when the external pair exists", async () => {
+      const stored = {
+        booking_id: VALID_UUID,
+        status: "pending",
+        channel: "ota:simulado",
+        channel_external_id: "EXT-123",
+        manage_token_hash: MANAGE_HASH,
+      };
+      mockPrisma.booking.findUnique.mockResolvedValue(stored);
+
+      const result = await bookingService.create({
+        ...baseInput,
+        channel: "ota:simulado",
+        channel_external_id: "EXT-123",
+      });
+
+      expect(result.booking_id).toBe(VALID_UUID);
+      expect(result.created).toBe(false);
+      // El token OTA determinista permite que el canal complete el reintento.
+      expect(result.manage_token).toHaveLength(64);
+      expect(mockPrisma.booking.create).not.toHaveBeenCalled();
+      expect(mockPrisma.eventOutbox.create).not.toHaveBeenCalled();
+    });
+
+    it("should return the winner when concurrent OTA ingests hit the unique constraint", async () => {
+      const stored = {
+        booking_id: VALID_UUID,
+        status: "pending",
+        channel: "ota:simulado",
+        channel_external_id: "EXT-123",
+        manage_token_hash: MANAGE_HASH,
+      };
+      mockPrisma.booking.findUnique
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(stored);
+      mockPrisma.booking.create.mockRejectedValue({
+        code: "P2002",
+        meta: { target: ["channel", "channel_external_id"] },
+      });
+
+      const result = await bookingService.create({
+        ...baseInput,
+        channel: "ota:simulado",
+        channel_external_id: "EXT-123",
+      });
+
+      expect(result.booking_id).toBe(VALID_UUID);
+      expect(result.created).toBe(false);
+      expect(result.manage_token).toHaveLength(64);
+      expect(mockPrisma.eventOutbox.create).not.toHaveBeenCalled();
     });
   });
 
@@ -309,12 +413,16 @@ describe("BookingService", () => {
           booking_id: VALID_UUID,
           status: "pending",
           hotel_id: HOTEL_ID,
+          guest_id: GENERATED_GUEST_ID,
+          guest_name: "Ana",
           version: 0,
           manage_token_hash: MANAGE_HASH,
           manage_token_expires_at: new Date(Date.now() + 3600_000),
           room_type_id: ROOM_TYPE_ID,
           check_in: new Date("2026-10-01"),
           check_out: new Date("2026-10-05"),
+          channel: "direct",
+          channel_external_id: null,
         })
         .mockResolvedValueOnce({ booking_id: VALID_UUID, status: "confirmed", version: 1 });
       mockPrisma.booking.updateMany.mockResolvedValue({ count: 1 });
@@ -328,6 +436,18 @@ describe("BookingService", () => {
       expect(mockPrisma.booking.updateMany).toHaveBeenCalledWith({
         where: { booking_id: VALID_UUID, status: "pending", version: 0 },
         data: { status: "confirmed", version: { increment: 1 } },
+      });
+      expect(mockPrisma.eventOutbox.create).toHaveBeenCalledWith({
+        data: {
+          event_type: "booking.confirmed",
+          payload: expect.objectContaining({
+            booking_id: VALID_UUID,
+            guest_id: GENERATED_GUEST_ID,
+            hotel_id: HOTEL_ID,
+            room_type_id: ROOM_TYPE_ID,
+            channel: "direct",
+          }),
+        },
       });
       expect(result.status).toBe("confirmed");
     });
@@ -453,6 +573,71 @@ describe("BookingService", () => {
         idempotency_key: `booking:${VALID_UUID}:confirm-compensate`,
       });
     });
+
+    it("should not release inventory if a concurrent request already confirmed", async () => {
+      mockReserve.mockResolvedValue({ reserved: true });
+      mockPrisma.booking.findUnique
+        .mockResolvedValueOnce({
+          booking_id: VALID_UUID,
+          status: "pending",
+          hotel_id: HOTEL_ID,
+          version: 0,
+          manage_token_hash: MANAGE_HASH,
+          manage_token_expires_at: new Date(Date.now() + 3600_000),
+          room_type_id: ROOM_TYPE_ID,
+          check_in: new Date("2026-10-01"),
+          check_out: new Date("2026-10-05"),
+        })
+        .mockResolvedValueOnce({ booking_id: VALID_UUID, status: "confirmed", version: 1 });
+      mockPrisma.booking.updateMany.mockResolvedValue({ count: 0 });
+
+      const result = await bookingService.confirm(VALID_UUID, { actor: STAFF });
+
+      expect(result.status).toBe("confirmed");
+      expect(mockRelease).not.toHaveBeenCalled();
+      expect(mockPrisma.eventOutbox.create).not.toHaveBeenCalled();
+    });
+
+    it("reconciles a durable pending reservation attempt and writes booking.confirmed", async () => {
+      mockPrisma.inventoryReservationAttempt.findMany.mockResolvedValue([
+        {
+          booking_id: VALID_UUID,
+          idempotency_key: `booking:${VALID_UUID}:confirm`,
+          status: "pending",
+          attempts: 2,
+          booking: {
+            booking_id: VALID_UUID,
+            status: "pending",
+            hotel_id: HOTEL_ID,
+            guest_id: GENERATED_GUEST_ID,
+            guest_name: "Ana",
+            version: 0,
+            room_type_id: ROOM_TYPE_ID,
+            check_in: new Date("2026-10-01"),
+            check_out: new Date("2026-10-05"),
+            channel: "direct",
+            channel_external_id: null,
+          },
+        },
+      ]);
+      mockReserve.mockResolvedValue({ reserved: true });
+      mockPrisma.booking.updateMany.mockResolvedValue({ count: 1 });
+
+      const reconciled = await bookingService.reconcilePendingConfirmations();
+
+      expect(reconciled).toBe(1);
+      expect(mockReserve).toHaveBeenCalledWith({
+        ...EXPECTED_RANGE,
+        idempotency_key: `booking:${VALID_UUID}:confirm`,
+      });
+      expect(mockPrisma.eventOutbox.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ event_type: "booking.confirmed" }),
+      });
+      expect(mockPrisma.inventoryReservationAttempt.update).toHaveBeenCalledWith({
+        where: { booking_id: VALID_UUID },
+        data: { status: "completed", last_error: null },
+      });
+    });
   });
 
   describe("listByUser", () => {
@@ -520,6 +705,10 @@ describe("BookingService", () => {
         hotel_id: HOTEL_ID,
         room_type_id: ROOM_TYPE_ID,
         status: "cancelled",
+        check_in: new Date("2026-10-01"),
+        check_out: new Date("2026-10-05"),
+        channel: "direct",
+        channel_external_id: null,
       });
 
       const result = await bookingService.cancel(VALID_UUID, { actor: STAFF });
@@ -540,6 +729,11 @@ describe("BookingService", () => {
             booking_id: VALID_UUID,
             hotel_id: HOTEL_ID,
             room_type_id: ROOM_TYPE_ID,
+            check_in: "2026-10-01",
+            check_out: "2026-10-05",
+            channel: "direct",
+            channel_external_id: null,
+            occurred_at: expect.any(String),
           },
         },
       });
@@ -556,6 +750,11 @@ describe("BookingService", () => {
         booking_id: VALID_UUID,
         status: "cancelled",
         hotel_id: HOTEL_ID,
+        room_type_id: ROOM_TYPE_ID,
+        check_in: new Date("2026-10-01"),
+        check_out: new Date("2026-10-05"),
+        channel: "direct",
+        channel_external_id: null,
       });
 
       const result = await bookingService.cancel(VALID_UUID, {

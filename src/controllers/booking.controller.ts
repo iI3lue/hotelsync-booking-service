@@ -1,6 +1,11 @@
 import { Request, Response, NextFunction } from "express";
 import { bookingService, BookingAccess } from "../services/booking.service.js";
-import { AuthRequest, isTrustedService } from "../lib/auth.js";
+import {
+  AuthRequest,
+  isChannelManager,
+  isTrustedService,
+} from "../lib/auth.js";
+import { AppError } from "../middleware/error-handler.js";
 
 function accessFrom(req: Request): BookingAccess {
   // El token viaja preferentemente en header: en query queda en logs,
@@ -55,9 +60,24 @@ export class BookingController {
 
   async create(req: Request, res: Response, next: NextFunction) {
     try {
+      // Ingesta de canales: los `ota:*` exigen la service key de Channel
+      // Manager. El canal se lee crudo acá (pre-validación Zod) solo para
+      // decidir la puerta; el formato lo valida el schema después.
+      const rawChannel = (req.body as { channel?: unknown })?.channel;
+      if (
+        typeof rawChannel === "string" &&
+        rawChannel.startsWith("ota:") &&
+        !isChannelManager(req)
+      ) {
+        throw new AppError(
+          401,
+          "Channel ingestion requires channel-manager credentials",
+          "Unauthorized"
+        );
+      }
       const actor = (req as AuthRequest).auth;
       const booking = await bookingService.create(req.body, actor);
-      res.status(201).json(booking);
+      res.status(booking.created ? 201 : 200).json(booking);
     } catch (err) {
       next(err);
     }

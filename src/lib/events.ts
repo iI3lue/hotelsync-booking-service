@@ -2,12 +2,14 @@
  * Event stub — Fase 1 MVP.
  *
  * Los eventos se publican como log estructurado con trazabilidad por
- * `booking_id`. En Fase 2 se cablean a RabbitMQ sin cambiar la firma:
- * Front Desk consume `booking.created`, Channel Manager lo publica
- * (reservas OTA) y Billing/Loyalty consumirán `checkout.completed`.
+ * `booking_id`. El contrato canónico es propiedad de Booking: el Channel
+ * Manager entrega reservas por API y nunca publica eventos de Booking.
+ * `booking.created` significa pending; `booking.confirmed` se publica solo
+ * tras reservar inventario y confirmar la transición local.
  */
 export type BookingEventType =
   | "booking.created"
+  | "booking.confirmed"
   | "booking.cancelled";
 
 export function publishEvent(

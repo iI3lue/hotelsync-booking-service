@@ -81,6 +81,10 @@ export function isTrustedService(req: Request): boolean {
     { header: "x-front-desk-key", secret: process.env.FRONT_DESK_SERVICE_KEY },
     { header: "x-housekeeping-key", secret: process.env.HOUSEKEEPING_SERVICE_KEY },
     { header: "x-billing-key", secret: process.env.BILLING_SERVICE_KEY },
+    {
+      header: "x-channel-manager-key",
+      secret: process.env.CHANNEL_MANAGER_SERVICE_KEY,
+    },
   ];
   return callers.some(({ header, secret }) => {
     if (!secret) return false;
@@ -91,6 +95,46 @@ export function isTrustedService(req: Request): boolean {
     const b = Buffer.from(secret, "utf8");
     return a.length === b.length && timingSafeEqual(a, b);
   });
+}
+
+/**
+ * Ingesta Channel Manager: service key dedicada (`x-channel-manager-key`).
+ * Solo este caller puede crear reservas `ota:*`; el par anónimo +
+ * `manage_token` queda reservado a huéspedes web. Nunca al browser.
+ */
+export function isChannelManager(req: Request): boolean {
+  const secret = process.env.CHANNEL_MANAGER_SERVICE_KEY;
+  if (!secret) return false;
+  const value = req.headers["x-channel-manager-key"];
+  const provided = Array.isArray(value) ? value[0] : value;
+  if (!provided) return false;
+  const a = Buffer.from(provided, "utf8");
+  const b = Buffer.from(secret, "utf8");
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+/**
+ * Reserva POST /bookings para el canal si el body declara un canal OTA.
+ * Se monta antes de Zod para que una petición OTA sin credenciales reciba
+ * 401 aunque el payload también esté mal formado.
+ */
+export function requireChannelManagerForOta(
+  req: Request,
+  _res: Response,
+  next: NextFunction
+): void {
+  const channel = (req.body as { channel?: unknown } | undefined)?.channel;
+  if (typeof channel === "string" && channel.startsWith("ota:") && !isChannelManager(req)) {
+    next(
+      new AppError(
+        401,
+        "Channel ingestion requires channel-manager credentials",
+        "Unauthorized"
+      )
+    );
+    return;
+  }
+  next();
 }
 
 /** Exige uno de los roles indicados (requiere `requireAuth` antes). */
