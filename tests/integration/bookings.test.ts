@@ -3,7 +3,7 @@ import request from "supertest";
 import express from "express";
 import bookingsRouter from "../../src/routes/bookings.js";
 import { errorHandler, AppError } from "../../src/middleware/error-handler.js";
-import { signAccessToken } from "../../../user-service/src/lib/tokens.js";
+import { signAccessToken } from "../helpers/tokens.js";
 
 // Mock Prisma
 jest.mock("../../src/lib/prisma.js", () => ({
@@ -15,6 +15,7 @@ jest.mock("../../src/lib/prisma.js", () => ({
       create: jest.fn(),
       update: jest.fn(),
       updateMany: jest.fn(),
+      count: jest.fn(),
     },
     eventOutbox: {
       create: jest.fn(),
@@ -49,6 +50,8 @@ const mockRelease = releaseInventory as jest.Mock;
 process.env.FRONT_DESK_SERVICE_KEY = "test-front-desk-key";
 process.env.HOUSEKEEPING_SERVICE_KEY = "test-housekeeping-key";
 process.env.BILLING_SERVICE_KEY = "test-billing-key";
+process.env.USER_SERVICE_KEY = "test-user-key";
+process.env.PAYMENT_SERVICE_KEY = "test-payment-key";
 process.env.CHANNEL_MANAGER_SERVICE_KEY = "test-channel-manager-key";
 process.env.CHANNEL_MANAGER_MANAGE_TOKEN_SECRET =
   "test-channel-manage-token-secret-32b!";
@@ -375,9 +378,17 @@ describe("Booking Service API", () => {
         check_in: new Date("2026-10-01"),
         check_out: new Date("2026-10-05"),
       });
+      // El outbox de booking.cancelled serializa fechas y hotel: el mock
+      // debe devolver la fila completa (antes faltaban y daba 500).
       mockPrisma.booking.update.mockResolvedValue({
         booking_id: VALID_UUID,
         status: "cancelled",
+        hotel_id: HOTEL_ID,
+        room_type_id: ROOM_TYPE_ID,
+        check_in: new Date("2026-10-01"),
+        check_out: new Date("2026-10-05"),
+        channel: "direct",
+        channel_external_id: null,
       });
 
       const res = await request(app).post(
@@ -412,6 +423,72 @@ describe("Booking Service API", () => {
       );
       expect(res.status).toBe(409);
       expect(mockRelease).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("GET /v1/bookings/by-user/:userId/has-active", () => {
+    it("should return 401 without the user service key", async () => {
+      const res = await request(app).get(
+        `/v1/bookings/by-user/${VALID_UUID}/has-active`
+      );
+      expect(res.status).toBe(401);
+      expect(mockPrisma.booking.count).not.toHaveBeenCalled();
+    });
+
+    it("should report active bookings with a valid service key", async () => {
+      mockPrisma.booking.count.mockResolvedValue(1);
+
+      const res = await request(app)
+        .get(`/v1/bookings/by-user/${VALID_UUID}/has-active`)
+        .set("x-user-key", "test-user-key");
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ has_active: true, count: 1 });
+    });
+
+    it("should return 400 for a non-UUID user id", async () => {
+      const res = await request(app)
+        .get("/v1/bookings/by-user/not-a-uuid/has-active")
+        .set("x-user-key", "test-user-key");
+      expect(res.status).toBe(400);
+      expect(mockPrisma.booking.count).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("payment-service (x-payment-key)", () => {
+    it("lee la reserva con la service key de pagos", async () => {
+      mockPrisma.booking.findUnique.mockResolvedValue({
+        booking_id: VALID_UUID,
+        status: "pending",
+        payment_status: "PENDING",
+        total_amount: 1260,
+        manage_token_hash: MANAGE_HASH,
+      });
+      const res = await request(app)
+        .get(`/v1/bookings/${VALID_UUID}`)
+        .set("x-payment-key", "test-payment-key");
+      expect(res.status).toBe(200);
+      expect(res.body.payment_status).toBe("PENDING");
+      expect(res.body).not.toHaveProperty("manage_token_hash");
+    });
+
+    it("rechaza una service key de pagos incorrecta", async () => {
+      const res = await request(app)
+        .get(`/v1/bookings/${VALID_UUID}`)
+        .set("x-payment-key", "wrong-key-wrong-key");
+      expect(res.status).toBe(401);
+    });
+
+    it("valida payment_method_preference en el alta", async () => {
+      const res = await request(app).post("/v1/bookings").send({
+        hotel_id: HOTEL_ID,
+        room_type_id: ROOM_TYPE_ID,
+        check_in: "2026-11-10",
+        check_out: "2026-11-13",
+        total_amount: 1260,
+        payment_method_preference: "BITCOIN",
+        guest: { name: "Ana", email: "ana@example.com", phone: "+573001112233" },
+      });
+      expect(res.status).toBe(400);
     });
   });
 });

@@ -81,6 +81,9 @@ export function isTrustedService(req: Request): boolean {
     { header: "x-front-desk-key", secret: process.env.FRONT_DESK_SERVICE_KEY },
     { header: "x-housekeeping-key", secret: process.env.HOUSEKEEPING_SERVICE_KEY },
     { header: "x-billing-key", secret: process.env.BILLING_SERVICE_KEY },
+    { header: "x-user-key", secret: process.env.USER_SERVICE_KEY },
+    // payment-service: verifica el total y el dueño antes de cobrar.
+    { header: "x-payment-key", secret: process.env.PAYMENT_SERVICE_KEY },
     {
       header: "x-channel-manager-key",
       secret: process.env.CHANNEL_MANAGER_SERVICE_KEY,
@@ -132,6 +135,22 @@ export function requireChannelManagerForOta(
         "Unauthorized"
       )
     );
+    return;
+  }
+  next();
+}
+
+/**
+ * Exige service key de un caller backend (server-to-server, sin JWT de
+ * usuario). Para endpoints consumidos por otros microservicios.
+ */
+export function requireTrustedService(
+  req: Request,
+  _res: Response,
+  next: NextFunction
+): void {
+  if (!isTrustedService(req)) {
+    next(new AppError(401, "Missing service credentials", "Unauthorized"));
     return;
   }
   next();

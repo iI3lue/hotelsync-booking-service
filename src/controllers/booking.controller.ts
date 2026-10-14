@@ -107,6 +107,15 @@ export class BookingController {
     }
   }
 
+  async hasActiveByUser(req: Request, res: Response, next: NextFunction) {
+    try {
+      const userId = req.params.userId as string;
+      res.json(await bookingService.hasActiveByUser(userId));
+    } catch (err) {
+      next(err);
+    }
+  }
+
   async cancel(req: Request, res: Response, next: NextFunction) {
     try {
       const id = req.params.id as string;

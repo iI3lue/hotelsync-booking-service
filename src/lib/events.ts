@@ -10,7 +10,8 @@
 export type BookingEventType =
   | "booking.created"
   | "booking.confirmed"
-  | "booking.cancelled";
+  | "booking.cancelled"
+  | "booking.paid";
 
 export function publishEvent(
   type: BookingEventType,

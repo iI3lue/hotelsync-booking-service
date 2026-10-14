@@ -13,6 +13,8 @@ import type { AuthClaims } from "../lib/auth.js";
 import {
   CreateBookingInput,
   ListBookingsQuery,
+  PaymentCompletedEvent,
+  PaymentMethodPreference,
 } from "../validators/booking.js";
 
 function toIsoDate(date: Date): string {
@@ -112,6 +114,23 @@ function manageTokenMatches(booking: ManagedBooking, token: string): boolean {
   );
 }
 
+/**
+ * Preferencia de pago efectiva. Sin valor explícito se conserva el
+ * comportamiento histórico: la web directa paga en línea; teléfono y OTA
+ * se cobran en el hotel.
+ */
+function resolvePaymentPreference(data: CreateBookingInput): PaymentMethodPreference {
+  if (data.payment_method_preference) return data.payment_method_preference;
+  return data.channel === "direct" ? "ONLINE" : "RECEPTION";
+}
+
+const PAYMENT_APPLY_MAX_ATTEMPTS = 3;
+
+export type PaymentApplyOutcome =
+  | "paid"
+  | "already_paid"
+  | "not_found";
+
 function stripManageHash<T extends { manage_token_hash?: unknown }>(
   booking: T
 ): Omit<T, "manage_token_hash"> {
@@ -182,6 +201,8 @@ export class BookingService {
             channel: data.channel,
             channel_external_id: data.channel_external_id ?? null,
             total_amount: data.total_amount,
+            payment_method_preference: resolvePaymentPreference(data),
+            payment_status: "PENDING",
           },
         });
 
@@ -200,6 +221,21 @@ export class BookingService {
 
         return created;
       });
+
+      // Flujo B (pago en recepción): la reserva nace confirmada con saldo
+      // pendiente, compatible con "Front Desk exige confirmed". Solo si el
+      // cliente lo pidió explícitamente; OTA/teléfono no cambian.
+      if (
+        data.payment_method_preference === "RECEPTION" &&
+        !data.channel.startsWith("ota:")
+      ) {
+        const confirmed = await this.confirmForReception(booking.booking_id);
+        return {
+          ...confirmed,
+          manage_token: manageToken,
+          created: true as const,
+        };
+      }
 
       return {
         ...stripManageHash(booking),
@@ -604,6 +640,111 @@ export class BookingService {
   }
 
   /**
+   * Confirma una reserva recién creada con pago en recepción.
+   * - Sin stock (409): la reserva no puede existir confirmada, así que se
+   *   cancela (nunca reservó inventario) y se devuelve el 409 al cliente.
+   * - R&A caído (502): queda `pending` con el intento durable; el
+   *   reconciliador la confirmará cuando R&A vuelva. Se devuelve tal cual.
+   */
+  private async confirmForReception(bookingId: string) {
+    const access: BookingAccess = { serviceAuthorized: true };
+    try {
+      return await this.confirm(bookingId, access);
+    } catch (error) {
+      if (error instanceof AppError && error.statusCode === 409) {
+        await this.cancel(bookingId, access).catch(() => undefined);
+        throw new AppError(
+          409,
+          "No rooms available for the selected dates",
+          "Conflict"
+        );
+      }
+      if (error instanceof AppError && error.statusCode === 502) {
+        return stripManageHash(await this.findById(bookingId));
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Aplica `payment.completed` (consumidor RabbitMQ). Idempotente: un
+   * evento repetido no cambia nada. Con versión optimista; ante conflicto
+   * relee y reintenta, y si persiste devuelve 409 para que el consumidor
+   * re-encole el mensaje.
+   *
+   * Si la reserva sigue `pending` (Flujo A), primero la confirma con la
+   * misma saga de inventario. Si no hay stock, el pago igual se registra
+   * (el dinero ya ingresó) y la reserva queda pendiente para gestión
+   * manual: nunca se cancela automáticamente (PRD 2026-10-14).
+   */
+  async applyPaymentCompleted(event: PaymentCompletedEvent): Promise<PaymentApplyOutcome> {
+    for (let attempt = 0; attempt < PAYMENT_APPLY_MAX_ATTEMPTS; attempt += 1) {
+      const booking = await prisma.booking.findUnique({
+        where: { booking_id: event.booking_id },
+      });
+      if (!booking) return "not_found";
+      if (booking.payment_status === "PAID") return "already_paid";
+
+      if (booking.status === "pending") {
+        try {
+          await this.confirm(booking.booking_id, { serviceAuthorized: true });
+        } catch (error) {
+          // 409 sin stock o carrera: se registra el pago igual. 502: el
+          // intento durable queda agendado y el reconciliador confirmará.
+          console.warn(
+            `[payments] booking ${booking.booking_id} paid but not confirmed: ${errorMessage(error)}`
+          );
+        }
+      }
+
+      const fresh = await prisma.booking.findUnique({
+        where: { booking_id: event.booking_id },
+      });
+      if (!fresh) return "not_found";
+      if (fresh.payment_status === "PAID") return "already_paid";
+
+      if (Number(fresh.total_amount) !== event.amount) {
+        console.warn(
+          `[payments] amount mismatch booking=${fresh.booking_id} total=${fresh.total_amount} paid=${event.amount}`
+        );
+      }
+
+      const marked = await prisma.$transaction(async (tx) => {
+        const updated = await tx.booking.updateMany({
+          where: {
+            booking_id: fresh.booking_id,
+            version: fresh.version,
+            payment_status: "PENDING",
+          },
+          data: {
+            payment_status: "PAID",
+            payment_transaction_id: event.transaction_id,
+            paid_at: new Date(),
+            version: { increment: 1 },
+          },
+        });
+        if (updated.count === 0) return false;
+        await enqueueOutboxEvent(tx, "booking.paid", {
+          booking_id: fresh.booking_id,
+          hotel_id: fresh.hotel_id,
+          transaction_id: event.transaction_id,
+          amount: event.amount,
+          currency: event.currency,
+          status: fresh.status,
+          occurred_at: new Date().toISOString(),
+        });
+        return true;
+      });
+      if (marked) return "paid";
+    }
+    throw new AppError(
+      409,
+      "Booking was modified concurrently, please retry",
+      "Conflict"
+    );
+  }
+
+  /**
    * Reservas propias de una cuenta: creadas con su sesion, o con su email
    * solo si el email esta verificado. Sin esto, registrarse con el correo
    * de otra persona permitiria leer sus reservas.
@@ -619,6 +760,25 @@ export class BookingService {
       orderBy: { check_in: "asc" },
     });
     return bookings.map(stripManageHash);
+  }
+
+  /**
+   * Chequeo para la baja de cuentas (user-service, server-to-server):
+   * reservas vinculadas a la cuenta en estado pendiente/confirmado con
+   * check-out hoy o futuro. Solo `booked_by_user_id` (vínculo exacto de
+   * cuenta, sin el fallback por email de `listByUser`).
+   */
+  async hasActiveByUser(userId: string) {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const count = await prisma.booking.count({
+      where: {
+        booked_by_user_id: userId,
+        status: { in: ["pending", "confirmed"] },
+        check_out: { gte: today },
+      },
+    });
+    return { has_active: count > 0, count };
   }
 
   /** Cancelacion con acceso: staff o manage token del huesped. */

@@ -3,6 +3,7 @@ import { errorHandler } from "./middleware/error-handler.js";
 import bookingsRouter from "./routes/bookings.js";
 import { startOutboxDispatcher } from "./lib/outbox.js";
 import { startConfirmationReconciler } from "./lib/confirmation-reconciler.js";
+import { startPaymentConsumer } from "./lib/consumer.js";
 
 const app = express();
 const PORT = process.env.PORT || 3004;
@@ -34,6 +35,11 @@ if (process.env.NODE_ENV !== "test") {
   if (process.env.RABBITMQ_URL) {
     startOutboxDispatcher();
     console.log("Outbox dispatcher started (hotelsync.events)");
+
+    // payment.completed → confirma (si hace falta) y marca PAID.
+    startPaymentConsumer().catch((err) =>
+      console.error("[payments-consumer] no se pudo iniciar", err)
+    );
   }
 
   startConfirmationReconciler();

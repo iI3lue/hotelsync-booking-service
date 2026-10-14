@@ -22,6 +22,9 @@ export const bookingChannelSchema = z
     "Channel must be direct, phone or ota:<name>"
   );
 
+/** Cómo prefiere pagar el huésped (PRD payment-service). */
+export const paymentMethodPreferenceSchema = z.enum(["ONLINE", "RECEPTION"]);
+
 const guestSchema = z.object({
   name: z.string().trim().min(1).max(255),
   email: z.string().trim().toLowerCase().email().max(255),
@@ -46,6 +49,9 @@ export const createBookingSchema = z
     channel_external_id: z.string().trim().min(1).max(100).optional(),
     total_amount: z.number().nonnegative(),
     guest: guestSchema,
+    // Opcional por compatibilidad: sin valor, direct => ONLINE y
+    // phone/ota => RECEPTION. Solo RECEPTION explícito confirma al crear.
+    payment_method_preference: paymentMethodPreferenceSchema.optional(),
   })
   .refine((data) => data.check_out > data.check_in, {
     message: "check_out must be after check_in",
@@ -67,6 +73,10 @@ export const bookingIdParamSchema = z.object({
   id: z.string().uuid(),
 });
 
+export const bookingUserIdParamSchema = z.object({
+  userId: z.string().uuid(),
+});
+
 export const listBookingsQuerySchema = z.object({
   hotel_id: z.string().uuid().optional(),
   status: bookingStatusSchema.optional(),
@@ -81,6 +91,21 @@ export const listBookingsQuerySchema = z.object({
 export const manageTokenQuerySchema = z.object({
   token: z.string().min(1).max(256).optional(),
 });
+
+/**
+ * Evento `payment.completed` publicado por payment-service. Se valida en el
+ * borde del consumidor igual que un body HTTP.
+ */
+export const paymentCompletedEventSchema = z.object({
+  booking_id: z.string().uuid(),
+  transaction_id: z.string().uuid(),
+  amount: z.number().nonnegative(),
+  currency: z.string().min(1).max(10),
+});
+
+export type PaymentCompletedEvent = z.infer<typeof paymentCompletedEventSchema>;
+export type PaymentMethodPreference = z.infer<typeof paymentMethodPreferenceSchema>;
+export type BookingUserIdParam = z.infer<typeof bookingUserIdParamSchema>;
 
 export type CreateBookingInput = z.infer<typeof createBookingSchema>;
 export type ListBookingsQuery = z.infer<typeof listBookingsQuerySchema>;

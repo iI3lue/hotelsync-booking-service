@@ -5,10 +5,12 @@ import {
   requireAuth,
   requireRole,
   requireChannelManagerForOta,
+  requireTrustedService,
 } from "../lib/auth.js";
 import { validate } from "../middleware/validate.js";
 import {
   bookingIdParamSchema,
+  bookingUserIdParamSchema,
   createBookingSchema,
   listBookingsQuerySchema,
   manageTokenQuerySchema,
@@ -36,6 +38,13 @@ router.get(
   "/me",
   requireAuth,
   bookingController.listMine.bind(bookingController)
+);
+// Server-to-server (user-service, baja de cuentas): sin JWT de usuario.
+router.get(
+  "/by-user/:userId/has-active",
+  requireTrustedService,
+  validate(bookingUserIdParamSchema, "params"),
+  bookingController.hasActiveByUser.bind(bookingController)
 );
 router.get(
   "/:id",

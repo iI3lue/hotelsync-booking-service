@@ -12,6 +12,7 @@ jest.mock("../../src/lib/prisma.js", () => ({
         create: jest.fn(),
       update: jest.fn(),
       updateMany: jest.fn(),
+      count: jest.fn(),
     },
     eventOutbox: {
       create: jest.fn(),
@@ -138,6 +139,8 @@ describe("BookingService", () => {
           channel: "direct",
           channel_external_id: null,
           total_amount: 25500,
+          payment_method_preference: "ONLINE",
+          payment_status: "PENDING",
         },
       });
       expect(mockPrisma.eventOutbox.create).toHaveBeenCalledWith({
@@ -792,6 +795,31 @@ describe("BookingService", () => {
       ).rejects.toThrow(AppError);
       expect(mockRelease).not.toHaveBeenCalled();
       expect(mockPrisma.booking.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("hasActiveByUser", () => {
+    it("should report active bookings with pending/confirmed status", async () => {
+      mockPrisma.booking.count.mockResolvedValue(2);
+
+      await expect(
+        bookingService.hasActiveByUser(USER_ID)
+      ).resolves.toEqual({ has_active: true, count: 2 });
+      expect(mockPrisma.booking.count).toHaveBeenCalledWith({
+        where: {
+          booked_by_user_id: USER_ID,
+          status: { in: ["pending", "confirmed"] },
+          check_out: { gte: expect.any(Date) },
+        },
+      });
+    });
+
+    it("should report no active bookings when count is zero", async () => {
+      mockPrisma.booking.count.mockResolvedValue(0);
+
+      await expect(
+        bookingService.hasActiveByUser(USER_ID)
+      ).resolves.toEqual({ has_active: false, count: 0 });
     });
   });
 });
