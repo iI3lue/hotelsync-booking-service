@@ -84,6 +84,8 @@ export function isTrustedService(req: Request): boolean {
     { header: "x-user-key", secret: process.env.USER_SERVICE_KEY },
     // payment-service: verifica el total y el dueño antes de cobrar.
     { header: "x-payment-key", secret: process.env.PAYMENT_SERVICE_KEY },
+    // loyalty-service: lee la reserva para acreditar puntos (earn).
+    { header: "x-loyalty-key", secret: process.env.LOYALTY_SERVICE_KEY },
     {
       header: "x-channel-manager-key",
       secret: process.env.CHANNEL_MANAGER_SERVICE_KEY,
