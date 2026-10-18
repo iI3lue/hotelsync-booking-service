@@ -1,5 +1,6 @@
 import { bookingService } from "../../src/services/booking.service.js";
 import { handlePaymentMessage } from "../../src/lib/consumer.js";
+import { handleRefundMessage } from "../../src/lib/refund-consumer.js";
 import { AppError } from "../../src/middleware/error-handler.js";
 
 jest.mock("../../src/lib/prisma.js", () => ({
@@ -142,7 +143,12 @@ describe("applyPaymentCompleted", () => {
     await expect(bookingService.applyPaymentCompleted(event)).resolves.toBe("paid");
 
     expect(mockPrisma.booking.updateMany).toHaveBeenLastCalledWith({
-      where: { booking_id: BOOKING_ID, version: 1, payment_status: "PENDING" },
+      where: {
+        booking_id: BOOKING_ID,
+        version: 1,
+        payment_status: "PENDING",
+        status: { not: "cancelled" },
+      },
       data: expect.objectContaining({ payment_status: "PAID", payment_transaction_id: TX_ID }),
     });
     expect(mockPrisma.eventOutbox.create).toHaveBeenCalledWith({
@@ -183,6 +189,44 @@ describe("applyPaymentCompleted", () => {
     await expect(bookingService.applyPaymentCompleted(event)).rejects.toMatchObject({ statusCode: 409 });
     expect(mockPrisma.booking.updateMany).toHaveBeenCalledTimes(3);
   });
+
+  it("no revive una reserva cancelada (reembolso en curso)", async () => {
+    mockPrisma.booking.findUnique.mockResolvedValue(
+      booking({ status: "cancelled", payment_status: "PENDING" })
+    );
+
+    await expect(bookingService.applyPaymentCompleted(event)).resolves.toBe("ignored");
+    expect(mockPrisma.booking.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+describe("applyPaymentRefunded", () => {
+  const refundEvent = { booking_id: BOOKING_ID, transaction_id: TX_ID, amount: 1260, currency: "COP" };
+
+  it("marca la reserva como REFUNDED", async () => {
+    mockPrisma.booking.findUnique.mockResolvedValue(
+      booking({ status: "cancelled", payment_status: "PAID" })
+    );
+    mockPrisma.booking.updateMany.mockResolvedValue({ count: 1 });
+
+    await expect(bookingService.applyPaymentRefunded(refundEvent)).resolves.toBe("refunded");
+    expect(mockPrisma.booking.updateMany).toHaveBeenCalledWith({
+      where: { booking_id: BOOKING_ID, payment_status: { not: "REFUNDED" } },
+      data: expect.objectContaining({
+        payment_status: "REFUNDED",
+        payment_transaction_id: TX_ID,
+      }),
+    });
+  });
+
+  it("es idempotente si ya estaba REFUNDED", async () => {
+    mockPrisma.booking.findUnique.mockResolvedValue(
+      booking({ status: "cancelled", payment_status: "REFUNDED" })
+    );
+
+    await expect(bookingService.applyPaymentRefunded(refundEvent)).resolves.toBe("ignored");
+    expect(mockPrisma.booking.updateMany).not.toHaveBeenCalled();
+  });
 });
 
 describe("consumidor payment.completed", () => {
@@ -220,5 +264,37 @@ describe("consumidor payment.completed", () => {
     expect(channel.nack).toHaveBeenCalledWith(m, false, true);
     expect(channel.ack).not.toHaveBeenCalled();
     jest.useRealTimers();
+  });
+});
+
+describe("consumidor payment.refunded", () => {
+  const channel = { ack: jest.fn(), nack: jest.fn() };
+  const msg = (body: unknown) => ({ content: Buffer.from(JSON.stringify(body)) }) as any;
+  const refundEvent = { booking_id: BOOKING_ID, transaction_id: TX_ID, amount: 1260, currency: "COP" };
+
+  beforeEach(() => {
+    channel.ack.mockReset();
+    channel.nack.mockReset();
+    jest.spyOn(console, "error").mockImplementation(() => undefined);
+    jest.spyOn(console, "warn").mockImplementation(() => undefined);
+  });
+
+  it("hace ack tras reflejar el reembolso", async () => {
+    mockPrisma.booking.findUnique.mockResolvedValue(
+      booking({ status: "cancelled", payment_status: "PAID" })
+    );
+    mockPrisma.booking.updateMany.mockResolvedValue({ count: 1 });
+    const m = msg(refundEvent);
+
+    await handleRefundMessage(channel, m, 0);
+
+    expect(channel.ack).toHaveBeenCalledWith(m);
+    expect(channel.nack).not.toHaveBeenCalled();
+  });
+
+  it("descarta (ack) payloads inválidos", async () => {
+    await handleRefundMessage(channel, msg({ booking_id: "no-uuid" }), 0);
+    expect(channel.ack).toHaveBeenCalled();
+    expect(mockPrisma.booking.findUnique).not.toHaveBeenCalled();
   });
 });

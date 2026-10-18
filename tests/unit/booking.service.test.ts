@@ -360,6 +360,35 @@ describe("BookingService", () => {
         bookingService.getByIdWithAccess(VALID_UUID, { token: "wrong" })
       ).rejects.toThrow(AppError);
     });
+
+    it("should allow the owner when allowOwner is set (Mis reservas)", async () => {
+      mockPrisma.booking.findUnique.mockResolvedValue({
+        ...stored,
+        booked_by_user_id: USER_ID,
+      });
+
+      const result = await bookingService.getByIdWithAccess(VALID_UUID, {
+        actor: { ...STAFF, role: "GUEST", hotel_id: null, scope: "global" },
+        allowOwner: true,
+      });
+
+      expect(result.booking_id).toBe(VALID_UUID);
+      expect(result).not.toHaveProperty("manage_token_hash");
+    });
+
+    it("should reject another guest even with allowOwner", async () => {
+      mockPrisma.booking.findUnique.mockResolvedValue({
+        ...stored,
+        booked_by_user_id: "ffffffff-ffff-4fff-bfff-ffffffffffff",
+      });
+
+      await expect(
+        bookingService.getByIdWithAccess(VALID_UUID, {
+          actor: { ...STAFF, role: "GUEST", hotel_id: null, scope: "global" },
+          allowOwner: true,
+        })
+      ).rejects.toThrow(AppError);
+    });
   });
 
   describe("list", () => {
@@ -794,6 +823,71 @@ describe("BookingService", () => {
         bookingService.cancel(VALID_UUID, { actor: STAFF })
       ).rejects.toThrow(AppError);
       expect(mockRelease).not.toHaveBeenCalled();
+      expect(mockPrisma.booking.update).not.toHaveBeenCalled();
+    });
+
+    it("should let the owner cancel a future pending booking", async () => {
+      const checkIn = new Date(Date.now() + 7 * 86_400_000);
+      const guest = {
+        ...STAFF,
+        role: "GUEST",
+        hotel_id: null,
+        scope: "global" as const,
+      };
+      mockPrisma.booking.findUnique.mockResolvedValue({
+        booking_id: VALID_UUID,
+        status: "pending",
+        hotel_id: HOTEL_ID,
+        manage_token_hash: MANAGE_HASH,
+        booked_by_user_id: USER_ID,
+        room_type_id: ROOM_TYPE_ID,
+        check_in: checkIn,
+        check_out: new Date(checkIn.getTime() + 3 * 86_400_000),
+      });
+      mockPrisma.booking.update.mockResolvedValue({
+        booking_id: VALID_UUID,
+        status: "cancelled",
+        hotel_id: HOTEL_ID,
+        room_type_id: ROOM_TYPE_ID,
+        check_in: checkIn,
+        check_out: new Date(checkIn.getTime() + 3 * 86_400_000),
+        channel: "direct",
+        channel_external_id: null,
+      });
+
+      const result = await bookingService.cancel(VALID_UUID, { actor: guest });
+
+      expect(result.status).toBe("cancelled");
+      expect(mockPrisma.booking.update).toHaveBeenCalledWith({
+        where: { booking_id: VALID_UUID },
+        data: { status: "cancelled" },
+      });
+      expect(mockPrisma.eventOutbox.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ event_type: "booking.cancelled" }),
+      });
+    });
+
+    it("should reject the owner cancelling after check-in", async () => {
+      const guest = {
+        ...STAFF,
+        role: "GUEST",
+        hotel_id: null,
+        scope: "global" as const,
+      };
+      mockPrisma.booking.findUnique.mockResolvedValue({
+        booking_id: VALID_UUID,
+        status: "confirmed",
+        hotel_id: HOTEL_ID,
+        manage_token_hash: MANAGE_HASH,
+        booked_by_user_id: USER_ID,
+        room_type_id: ROOM_TYPE_ID,
+        check_in: new Date(Date.now() - 86_400_000),
+        check_out: new Date(Date.now() + 86_400_000),
+      });
+
+      await expect(
+        bookingService.cancel(VALID_UUID, { actor: guest })
+      ).rejects.toMatchObject({ statusCode: 409 });
       expect(mockPrisma.booking.update).not.toHaveBeenCalled();
     });
   });

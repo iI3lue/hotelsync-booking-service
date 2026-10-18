@@ -375,8 +375,8 @@ describe("Booking Service API", () => {
         status: "confirmed",
         manage_token_hash: MANAGE_HASH,
         room_type_id: ROOM_TYPE_ID,
-        check_in: new Date("2026-10-01"),
-        check_out: new Date("2026-10-05"),
+        check_in: new Date("2027-10-01"),
+        check_out: new Date("2027-10-05"),
       });
       // El outbox de booking.cancelled serializa fechas y hotel: el mock
       // debe devolver la fila completa (antes faltaban y daba 500).
@@ -385,8 +385,8 @@ describe("Booking Service API", () => {
         status: "cancelled",
         hotel_id: HOTEL_ID,
         room_type_id: ROOM_TYPE_ID,
-        check_in: new Date("2026-10-01"),
-        check_out: new Date("2026-10-05"),
+        check_in: new Date("2027-10-01"),
+        check_out: new Date("2027-10-05"),
         channel: "direct",
         channel_external_id: null,
       });

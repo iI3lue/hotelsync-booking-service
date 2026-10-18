@@ -104,6 +104,15 @@ export const paymentCompletedEventSchema = z.object({
 });
 
 export type PaymentCompletedEvent = z.infer<typeof paymentCompletedEventSchema>;
+
+export const paymentRefundedEventSchema = z.object({
+  booking_id: z.string().uuid(),
+  transaction_id: z.string().uuid(),
+  amount: z.number().nonnegative(),
+  currency: z.string().min(1).max(10),
+});
+
+export type PaymentRefundedEvent = z.infer<typeof paymentRefundedEventSchema>;
 export type PaymentMethodPreference = z.infer<typeof paymentMethodPreferenceSchema>;
 export type BookingUserIdParam = z.infer<typeof bookingUserIdParamSchema>;
 

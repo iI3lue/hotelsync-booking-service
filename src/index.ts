@@ -4,6 +4,7 @@ import bookingsRouter from "./routes/bookings.js";
 import { startOutboxDispatcher } from "./lib/outbox.js";
 import { startConfirmationReconciler } from "./lib/confirmation-reconciler.js";
 import { startPaymentConsumer } from "./lib/consumer.js";
+import { startRefundConsumer } from "./lib/refund-consumer.js";
 
 const app = express();
 const PORT = process.env.PORT || 3004;
@@ -39,6 +40,11 @@ if (process.env.NODE_ENV !== "test") {
     // payment.completed → confirma (si hace falta) y marca PAID.
     startPaymentConsumer().catch((err) =>
       console.error("[payments-consumer] no se pudo iniciar", err)
+    );
+
+    // payment.refunded -> refleja el reembolso simulado de una cancelación.
+    startRefundConsumer().catch((err) =>
+      console.error("[refunds-consumer] no se pudo iniciar", err)
     );
   }
 

@@ -23,6 +23,8 @@ Node.js ≥20 · TypeScript · Express · Prisma · PostgreSQL 16 · Zod · Rabb
 
 `Route → Controller → Service → Prisma`. La creación abre una transacción, llama a R&A (`/availability/reserve`) y persiste la reserva; si algo falla, libera el inventario (`/release`) como compensación. La confirmación usa versión optimista: un `version` desactualizado devuelve **409**. Los eventos se encolan en `EventOutbox` dentro de la transacción y un dispatcher los publica.
 
+La cancelación no borra la reserva: la pasa a `cancelled` y libera inventario. El dueño exacto (`booked_by_user_id`) puede cancelar desde "Mis reservas" sólo antes del check-in y mientras siga `pending`/`confirmed`; el staff no tiene esa restricción. Si estaba paga, payment-service consume `booking.cancelled` y emite `payment.refunded`, que este servicio aplica como `payment_status = REFUNDED`.
+
 ## Endpoints
 
 | Método | Ruta | Auth | Descripción |
@@ -34,7 +36,7 @@ Node.js ≥20 · TypeScript · Express · Prisma · PostgreSQL 16 · Zod · Rabb
 | GET | `/v1/bookings/by-user/:userId/has-active` | `x-user-key` | ¿Tiene reservas activas? (user-service) |
 | GET | `/v1/bookings/:id` | JWT o `x-manage-token` | Detalle de reserva |
 | POST | `/v1/bookings/:id/confirm` | JWT o `x-manage-token` | Confirma (versión optimista, 409 en conflicto) |
-| POST | `/v1/bookings/:id/cancel` | JWT o `x-manage-token` | Cancela y libera inventario |
+| POST | `/v1/bookings/:id/cancel` | JWT del dueño, staff o `x-manage-token` | Cancela y libera inventario (no staff: sólo antes del check-in) |
 
 Claves internas aceptadas: `x-user-key`, `x-payment-key`, `x-billing-key`, `x-front-desk-key`, `x-housekeeping-key`, `x-loyalty-key`, `x-channel-manager-key`.
 
@@ -48,7 +50,7 @@ Migraciones en `prisma/migrations` (7). Seed: una reserva demo (`hotel_id` 2222�
 
 - **REST saliente:** Rate & Availability `POST /v1/availability/reserve` y `/release` (header `x-service-key`).
 - **Publica:** `booking.created`, `booking.confirmed`, `booking.cancelled`, `booking.paid`.
-- **Consume:** `payment.completed` (cola durable `booking.payments`) → marca la reserva como pagada.
+- **Consume:** `payment.completed` (cola durable `booking.payments`) → marca la reserva como pagada; `payment.refunded` (cola durable `booking.refunds`) → `payment_status = REFUNDED`.
 - **Entrante:** front-desk, billing, housekeeping, loyalty, user y payment consultan reservas con sus respectivas claves.
 
 ## Variables de entorno

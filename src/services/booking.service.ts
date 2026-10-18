@@ -15,6 +15,7 @@ import {
   ListBookingsQuery,
   PaymentCompletedEvent,
   PaymentMethodPreference,
+  PaymentRefundedEvent,
 } from "../validators/booking.js";
 
 function toIsoDate(date: Date): string {
@@ -26,6 +27,8 @@ export interface BookingAccess {
   actor?: AuthClaims;
   token?: string;
   serviceAuthorized?: boolean;
+  /** El huésped dueño (`booked_by_user_id`) puede operar su propia reserva. */
+  allowOwner?: boolean;
 }
 
 const STAFF_ROLES = ["SUPER_ADMIN", "MANAGER", "RECEPTIONIST"];
@@ -129,7 +132,9 @@ const PAYMENT_APPLY_MAX_ATTEMPTS = 3;
 export type PaymentApplyOutcome =
   | "paid"
   | "already_paid"
-  | "not_found";
+  | "refunded"
+  | "not_found"
+  | "ignored";
 
 function stripManageHash<T extends { manage_token_hash?: unknown }>(
   booking: T
@@ -403,6 +408,14 @@ export class BookingService {
       return stripManageHash(booking);
     }
     if (access.token && manageTokenMatches(booking, access.token)) {
+      return stripManageHash(booking);
+    }
+    if (
+      access.allowOwner &&
+      access.actor &&
+      booking.booked_by_user_id &&
+      booking.booked_by_user_id === access.actor.sub
+    ) {
       return stripManageHash(booking);
     }
     throw new AppError(403, "Not allowed to access this booking", "Forbidden");
@@ -684,6 +697,9 @@ export class BookingService {
       });
       if (!booking) return "not_found";
       if (booking.payment_status === "PAID") return "already_paid";
+      if (booking.status === "cancelled" || booking.payment_status === "REFUNDED") {
+        return "ignored";
+      }
 
       if (booking.status === "pending") {
         try {
@@ -702,6 +718,9 @@ export class BookingService {
       });
       if (!fresh) return "not_found";
       if (fresh.payment_status === "PAID") return "already_paid";
+      if (fresh.status === "cancelled" || fresh.payment_status === "REFUNDED") {
+        return "ignored";
+      }
 
       if (Number(fresh.total_amount) !== event.amount) {
         console.warn(
@@ -715,6 +734,7 @@ export class BookingService {
             booking_id: fresh.booking_id,
             version: fresh.version,
             payment_status: "PENDING",
+            status: { not: "cancelled" },
           },
           data: {
             payment_status: "PAID",
@@ -742,6 +762,32 @@ export class BookingService {
       "Booking was modified concurrently, please retry",
       "Conflict"
     );
+  }
+
+  /**
+   * Aplica `payment.refunded` (reembolso simulado tras cancelar). No cambia
+   * el estado de la reserva (ya está cancelada): solo refleja el reembolso
+   * para que el huésped y recepción vean el mismo dato. Idempotente.
+   */
+  async applyPaymentRefunded(event: PaymentRefundedEvent): Promise<PaymentApplyOutcome> {
+    const booking = await prisma.booking.findUnique({
+      where: { booking_id: event.booking_id },
+    });
+    if (!booking) return "not_found";
+    if (booking.payment_status === "REFUNDED") return "ignored";
+
+    const updated = await prisma.booking.updateMany({
+      where: {
+        booking_id: event.booking_id,
+        payment_status: { not: "REFUNDED" },
+      },
+      data: {
+        payment_status: "REFUNDED",
+        payment_transaction_id: event.transaction_id,
+        version: { increment: 1 },
+      },
+    });
+    return updated.count > 0 ? "refunded" : "ignored";
   }
 
   /**
@@ -781,12 +827,37 @@ export class BookingService {
     return { has_active: count > 0, count };
   }
 
-  /** Cancelacion con acceso: staff o manage token del huesped. */
+  /** Cancelación con acceso: staff, manage token o el huésped dueño. */
   async cancel(id: string, access: BookingAccess) {
-    const existing = await this.getByIdWithAccess(id, access);
+    const existing = await this.getByIdWithAccess(id, {
+      ...access,
+      allowOwner: true,
+    });
 
     if (existing.status === "cancelled") {
       throw new AppError(409, "Booking is already cancelled", "Conflict");
+    }
+
+    const staffAccess =
+      access.serviceAuthorized ||
+      Boolean(access.actor && STAFF_ROLES.includes(access.actor.role));
+    if (!staffAccess) {
+      if (existing.status !== "pending" && existing.status !== "confirmed") {
+        throw new AppError(
+          409,
+          `Cannot cancel booking with status ${existing.status}`,
+          "Conflict"
+        );
+      }
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      if (existing.check_in < today) {
+        throw new AppError(
+          409,
+          "Cannot cancel a booking after check-in",
+          "Conflict"
+        );
+      }
     }
 
     if (existing.status === "confirmed") {
