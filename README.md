@@ -1,39 +1,110 @@
-# hotelsync-booking-service
+# HotelSync — Booking Service
 
-Microservicio Booking de HotelSync: reservas con bloqueo optimista contra sobreventa.
+Microservicio de reservas de HotelSync: crea, confirma y cancela reservas con control optimista de versión y coordina el inventario con Rate & Availability para evitar sobreventa.
 
-Extraído del monorepo HotelSync como repo autocontenido (un repo por microservicio).
+- **Producción:** https://hotelsync-booking-service.onrender.com
+- **Puerto local:** 3004
+- **Base de datos:** `booking_db` (PostgreSQL 16)
 
-## Stack
+## Responsabilidad
 
-Node 20 · Express 4 · Prisma 6 (PostgreSQL) · RabbitMQ (amqplib) · TypeScript · Jest + ts-jest
+| Hace | No hace |
+| --- | --- |
+| Crear/confirmar/cancelar reservas | Gestionar inventario (reserva y libera vía R&A) |
+| Evitar sobreventa con reserva atómica + versión optimista (409) | Cobrar (emite/consume eventos de pago) |
+| Emitir `booking.created/confirmed/cancelled/paid` | Hacer check-in/check-out |
+| Aceptar reservas OTA del channel-manager con clave interna | Ser dueño de tarifas ni del catálogo |
+
+## Tecnologías
+
+Node.js ≥20 · TypeScript · Express · Prisma · PostgreSQL 16 · Zod · RabbitMQ (outbox + consumidor de pagos).
+
+## Arquitectura interna
+
+`Route → Controller → Service → Prisma`. La creación abre una transacción, llama a R&A (`/availability/reserve`) y persiste la reserva; si algo falla, libera el inventario (`/release`) como compensación. La confirmación usa versión optimista: un `version` desactualizado devuelve **409**. Los eventos se encolan en `EventOutbox` dentro de la transacción y un dispatcher los publica.
+
+## Endpoints
+
+| Método | Ruta | Auth | Descripción |
+| --- | --- | --- | --- |
+| GET | `/health` | — | Estado del servicio |
+| GET | `/v1/bookings` | JWT + staff | Lista reservas con filtros |
+| POST | `/v1/bookings` | JWT opcional / `x-channel-manager-key` | Crea reserva (OTA exige clave del channel-manager) |
+| GET | `/v1/bookings/me` | JWT | Reservas del usuario |
+| GET | `/v1/bookings/by-user/:userId/has-active` | `x-user-key` | ¿Tiene reservas activas? (user-service) |
+| GET | `/v1/bookings/:id` | JWT o `x-manage-token` | Detalle de reserva |
+| POST | `/v1/bookings/:id/confirm` | JWT o `x-manage-token` | Confirma (versión optimista, 409 en conflicto) |
+| POST | `/v1/bookings/:id/cancel` | JWT o `x-manage-token` | Cancela y libera inventario |
+
+Claves internas aceptadas: `x-user-key`, `x-payment-key`, `x-billing-key`, `x-front-desk-key`, `x-housekeeping-key`, `x-loyalty-key`, `x-channel-manager-key`.
+
+## Modelo de datos
+
+Tablas: `Booking`, `InventoryReservationAttempt`, `EventOutbox`.
+
+Migraciones en `prisma/migrations` (7). Seed: una reserva demo (`hotel_id` 2222…, `room_type_id` 3333…).
+
+## Comunicación
+
+- **REST saliente:** Rate & Availability `POST /v1/availability/reserve` y `/release` (header `x-service-key`).
+- **Publica:** `booking.created`, `booking.confirmed`, `booking.cancelled`, `booking.paid`.
+- **Consume:** `payment.completed` (cola durable `booking.payments`) → marca la reserva como pagada.
+- **Entrante:** front-desk, billing, housekeeping, loyalty, user y payment consultan reservas con sus respectivas claves.
 
 ## Variables de entorno
 
-| Variable           | Uso                                             |
-| ------------------ | ----------------------------------------------- |
-| `PORT`             | Puerto HTTP (Render inyecta el suyo, ej. 10000) |
-| `DATABASE_URL`     | Conexión **con pooling** para runtime           |
-| `DIRECT_URL`       | Conexión **directa** solo para `migrate deploy` |
-| `RATE_SERVICE_URL` | URL base del rate-availability (`.../v1`)       |
-| `RABBITMQ_URL`     | RabbitMQ (CloudAMQP); vacío = sin eventos       |
-| `NODE_ENV`         | `development` / `production`                    |
+| Variable | Obligatoria | Descripción |
+| --- | --- | --- |
+| `PORT` | No | Puerto HTTP (default 3004) |
+| `DATABASE_URL` | Sí | PostgreSQL de `booking_db` |
+| `AUTH_JWT_SECRET` | Sí | HS256 compartido |
+| `RATE_SERVICE_URL` | Sí | Base de Rate & Availability |
+| `SERVICE_API_KEY` | Sí | Clave hacia R&A (`x-service-key`) |
+| `RABBITMQ_URL` | No | Sin ella el outbox queda `pending` |
+| `CHANNEL_MANAGER_SERVICE_KEY` | Sí | Clave que presenta el channel-manager |
+| `CHANNEL_MANAGER_MANAGE_TOKEN_SECRET` | Sí | Firma de `x-manage-token` de reservas OTA |
+| `PAYMENT_SERVICE_KEY` | Sí | Debe coincidir con payment-service |
+| `USER_SERVICE_KEY` | Sí | Debe coincidir con user-service |
+| `BILLING_SERVICE_KEY` | Sí | Debe coincidir con billing-service |
+| `FRONT_DESK_SERVICE_KEY` | Sí | Debe coincidir con front-desk-service |
+| `HOUSEKEEPING_SERVICE_KEY` | Sí | Debe coincidir con housekeeping-service |
+| `LOYALTY_SERVICE_KEY` | Sí | Debe coincidir con loyalty-service |
 
-Ver `.env.example`. Sin `RABBITMQ_URL` el servicio arranca igual pero no publica eventos.
+Copiar `.env.example` a `.env` y completar los valores.
 
-## Scripts
+## Ejecución local
 
-- `npm run dev` — desarrollo con recarga
-- `npm run build` / `npm start` — compilación y arranque
-- `npm run lint` — `tsc --noEmit`
-- `npm test` — Jest (unit + integration; integración requiere DB)
-- `npm run seed` — datos de ejemplo
+```bash
+npm install
+cp .env.example .env
+npx prisma migrate deploy
+npm run seed
+npm run dev                 # http://localhost:3004
+```
 
-## Health
+## Despliegue
 
-`GET /health` → `{ status: "ok" }` (usado como healthCheckPath en Render).
+Render (Oregon, free): build `npm ci && npx prisma generate && npm run build`; start `npx prisma migrate deploy && npm start`; Neon `booking_db`. El plan free duerme a los 15 minutos.
 
-## Despliegue (Render, plan free)
+## Pruebas y verificación
 
-Build: `npm ci && npx prisma generate && npm run build`
-Start: `npx prisma migrate deploy && npm start`
+```bash
+npm test
+npm run lint
+curl https://hotelsync-booking-service.onrender.com/health
+```
+
+## Respaldo de base de datos
+
+```bash
+pg_dump "$DATABASE_URL" -Fc -f booking_db.dump
+pg_restore --clean --if-exists -d "$DATABASE_URL" booking_db.dump
+```
+
+## Estructura
+
+```
+src/{routes,controllers,services,validators,middleware,lib}
+prisma/{schema.prisma,seed.ts,migrations}
+tests/
+```
