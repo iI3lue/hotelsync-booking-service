@@ -44,7 +44,7 @@ Claves internas aceptadas: `x-user-key`, `x-payment-key`, `x-billing-key`, `x-fr
 
 Tablas: `Booking`, `InventoryReservationAttempt`, `EventOutbox`.
 
-Migraciones en `prisma/migrations` (7). Seed: una reserva demo (`hotel_id` 2222…, `room_type_id` 3333…).
+Migraciones en `prisma/migrations` (8). `payment_status` admite `PENDING`, `PAID` y `REFUNDED` (CHECK de la última migración). Seed: una reserva demo (`hotel_id` 2222…, `room_type_id` 3333…).
 
 ## Comunicación
 
