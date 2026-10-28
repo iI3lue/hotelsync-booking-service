@@ -5,51 +5,27 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      fail_on_purpose:
+        description: "Force a controlled failure to demonstrate the red path"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  lint-test-build:
-    runs-on: ubuntu-latest
-
-    services:
-      booking-db:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_DB: booking_db
-          POSTGRES_USER: hotelsync
-          POSTGRES_PASSWORD: hotelsync_dev
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-    env:
-      DATABASE_URL: postgresql://hotelsync:hotelsync_dev@localhost:5432/booking_db
-      DIRECT_URL: postgresql://hotelsync:hotelsync_dev@localhost:5432/booking_db
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Prisma generate + migrate
-        run: |
-          npx prisma generate
-          npx prisma migrate deploy
-
-      - name: Lint (tsc --noEmit)
-        run: npm run lint
-
-      - name: Build
-        run: npm run build
-
-      - name: Tests
-        run: npm test
+  ci:
+    uses: iI3lue/hotelsync-loyalty-service/.github/workflows/node-service-ci.yml@ci-v1
+    with:
+      service_name: booking-service
+      db_name: booking_db
+      fail_on_purpose: ${{ github.event_name == 'workflow_dispatch' && inputs.fail_on_purpose || false }}
+    secrets:
+      CI_POSTGRES_PASSWORD: ${{ secrets.CI_POSTGRES_PASSWORD }}
