@@ -1,3 +1,4 @@
+import { gatewayHeaders } from "../middleware/gateway.js";
 import { AppError } from "../middleware/error-handler.js";
 
 const RATE_SERVICE_URL =
@@ -24,6 +25,7 @@ async function ratePost<T>(path: string, body: unknown): Promise<T> {
     res = await fetch(`${RATE_SERVICE_URL}${path}`, {
       method: "POST",
       headers: {
+        ...gatewayHeaders(),
         "Content-Type": "application/json",
         ...(SERVICE_API_KEY ? { "x-service-key": SERVICE_API_KEY } : {}),
       },
