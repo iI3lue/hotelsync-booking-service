@@ -6,9 +6,13 @@ import { startOutboxDispatcher } from "./lib/outbox.js";
 import { startConfirmationReconciler } from "./lib/confirmation-reconciler.js";
 import { startPaymentConsumer } from "./lib/consumer.js";
 import { startRefundConsumer } from "./lib/refund-consumer.js";
+import { httpMetrics, metricsHandler } from "./lib/metrics.js";
 
 const app = express();
 const PORT = process.env.PORT || 3004;
+
+app.use(httpMetrics);
+app.get("/metrics", metricsHandler);
 
 app.use(requireGateway);
 

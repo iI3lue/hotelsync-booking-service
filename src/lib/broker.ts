@@ -125,8 +125,12 @@ export function startDispatcher(
   return timer;
 }
 
+export function isConnected(): boolean {
+  return confirmChannel !== null;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export const broker = { connect, publish, createDispatcher, startDispatcher };
+export const broker = { connect, publish, createDispatcher, startDispatcher, isConnected };
