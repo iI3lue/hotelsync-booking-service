@@ -230,8 +230,17 @@ describe("applyPaymentRefunded", () => {
 });
 
 describe("consumidor payment.completed", () => {
-  const channel = { ack: jest.fn(), nack: jest.fn() };
-  const msg = (body: unknown) => ({ content: Buffer.from(typeof body === "string" ? body : JSON.stringify(body)) }) as any;
+  const channel = {
+    ack: jest.fn(),
+    nack: jest.fn(),
+    sendToQueue: jest.fn(
+      (_queue: string, _content: Buffer, _options: unknown, callback?: (error: unknown) => void) => {
+        callback?.(null);
+        return true;
+      }
+    ),
+  };
+  const msg = (body: unknown) => ({ fields: { routingKey: "payment.completed" }, properties: { headers: {} }, content: Buffer.from(typeof body === "string" ? body : JSON.stringify(body)) }) as any;
 
   beforeEach(() => {
     channel.ack.mockReset();
@@ -243,14 +252,14 @@ describe("consumidor payment.completed", () => {
   it("hace ack tras aplicar el pago", async () => {
     mockPrisma.booking.findUnique.mockResolvedValue(booking({ status: "confirmed", payment_status: "PAID" }));
     const m = msg(event);
-    await handlePaymentMessage(channel, m, 0);
+    await handlePaymentMessage(channel, m);
     expect(channel.ack).toHaveBeenCalledWith(m);
     expect(channel.nack).not.toHaveBeenCalled();
   });
 
   it("descarta (ack) payloads inválidos sin tocar la base", async () => {
-    await handlePaymentMessage(channel, msg({ booking_id: "no-uuid" }), 0);
-    await handlePaymentMessage(channel, msg("{no json"), 0);
+    await handlePaymentMessage(channel, msg({ booking_id: "no-uuid" }));
+    await handlePaymentMessage(channel, msg("{no json"));
     expect(channel.ack).toHaveBeenCalledTimes(2);
     expect(mockPrisma.booking.findUnique).not.toHaveBeenCalled();
   });
@@ -259,17 +268,29 @@ describe("consumidor payment.completed", () => {
     jest.useFakeTimers();
     mockPrisma.booking.findUnique.mockRejectedValue(new Error("db down"));
     const m = msg(event);
-    await handlePaymentMessage(channel, m, 10);
-    jest.advanceTimersByTime(10);
-    expect(channel.nack).toHaveBeenCalledWith(m, false, true);
-    expect(channel.ack).not.toHaveBeenCalled();
+    await handlePaymentMessage(channel, m);
+    expect(channel.sendToQueue).not.toHaveBeenCalled();
+    await jest.advanceTimersByTimeAsync(2000);
+    expect(channel.sendToQueue).toHaveBeenCalledTimes(1);
+    expect(channel.sendToQueue.mock.calls[0][0]).toBe("booking.payments");
+    expect(channel.ack).toHaveBeenCalledWith(m);
+    expect(channel.nack).not.toHaveBeenCalled();
     jest.useRealTimers();
   });
 });
 
 describe("consumidor payment.refunded", () => {
-  const channel = { ack: jest.fn(), nack: jest.fn() };
-  const msg = (body: unknown) => ({ content: Buffer.from(JSON.stringify(body)) }) as any;
+  const channel = {
+    ack: jest.fn(),
+    nack: jest.fn(),
+    sendToQueue: jest.fn(
+      (_queue: string, _content: Buffer, _options: unknown, callback?: (error: unknown) => void) => {
+        callback?.(null);
+        return true;
+      }
+    ),
+  };
+  const msg = (body: unknown) => ({ fields: { routingKey: "payment.refunded" }, properties: { headers: {} }, content: Buffer.from(JSON.stringify(body)) }) as any;
   const refundEvent = { booking_id: BOOKING_ID, transaction_id: TX_ID, amount: 1260, currency: "COP" };
 
   beforeEach(() => {
@@ -286,14 +307,14 @@ describe("consumidor payment.refunded", () => {
     mockPrisma.booking.updateMany.mockResolvedValue({ count: 1 });
     const m = msg(refundEvent);
 
-    await handleRefundMessage(channel, m, 0);
+    await handleRefundMessage(channel, m);
 
     expect(channel.ack).toHaveBeenCalledWith(m);
     expect(channel.nack).not.toHaveBeenCalled();
   });
 
   it("descarta (ack) payloads inválidos", async () => {
-    await handleRefundMessage(channel, msg({ booking_id: "no-uuid" }), 0);
+    await handleRefundMessage(channel, msg({ booking_id: "no-uuid" }));
     expect(channel.ack).toHaveBeenCalled();
     expect(mockPrisma.booking.findUnique).not.toHaveBeenCalled();
   });
