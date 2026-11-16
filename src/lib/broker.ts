@@ -39,9 +39,10 @@ export async function connect(): Promise<ConfirmChannel> {
         return channel;
       } catch (err) {
         attempt += 1;
+        const reason = err instanceof Error ? err.message : String(err);
         const delay = Math.min(RETRY_BASE_MS * 2 ** (attempt - 1), RETRY_MAX_MS);
         console.warn(
-          `[broker] no se pudo conectar a RabbitMQ (intento ${attempt}), reintento en ${delay}ms`
+          `[broker] no se pudo conectar a RabbitMQ (intento ${attempt}): ${reason} - reintento en ${delay}ms`
         );
         await sleep(delay);
       }

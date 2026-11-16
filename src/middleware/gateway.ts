@@ -54,6 +54,8 @@ function logMiss(req: Request): void {
 export function requireGateway(req: Request, res: Response, next: NextFunction): void {
   const mode = currentMode();
   announce(mode);
+  res.locals = res.locals ?? {};
+  res.locals.gatewayAuthenticated = false;
   if (mode === "off" || req.path === "/health") return next();
 
   const provided = req.headers["x-gateway-secret"];
@@ -61,6 +63,7 @@ export function requireGateway(req: Request, res: Response, next: NextFunction):
     equalsSecret(provided, process.env.GATEWAY_SECRET) ||
     equalsSecret(provided, process.env.GATEWAY_SECRET_PREVIOUS)
   ) {
+    res.locals.gatewayAuthenticated = true;
     return next();
   }
 
