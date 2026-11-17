@@ -1,0 +1,61 @@
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to Render
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Trigger Render deploy hook
+        env:
+          DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: |
+          if [ -z "${DEPLOY_HOOK}" ]; then
+            echo "::error::RENDER_DEPLOY_HOOK is not configured (Settings > Secrets and variables > Actions)."
+            exit 1
+          fi
+          status=$(curl -sS -o /tmp/hook.out -w '%{http_code}' -X POST "$DEPLOY_HOOK")
+          echo "Render responded HTTP $status"
+          cat /tmp/hook.out || true
+          case "$status" in
+            2*) echo "Deploy queued on Render" ;;
+            *) echo "::error::Render deploy hook failed with HTTP $status"; exit 1 ;;
+          esac
+
+      - name: Wait for service health
+        if: ${{ vars.HEALTH_URL != '' }}
+        continue-on-error: true
+        env:
+          HEALTH_URL: ${{ vars.HEALTH_URL }}
+        run: |
+          deadline=$((SECONDS + 600))
+          while [ $SECONDS -lt $deadline ]; do
+            code=$(curl -sS -o /tmp/health.out -w '%{http_code}' --max-time 30 "$HEALTH_URL" || echo 000)
+            echo "GET $HEALTH_URL -> $code"
+            if [ "$code" = "200" ]; then
+              cat /tmp/health.out || true
+              echo "Service reported healthy"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::warning::Service did not return 200 within 10 minutes. Free tier cold starts can delay it; check the Render dashboard."
